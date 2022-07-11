@@ -36,6 +36,6 @@ public final class Redirect_Zeze_Arch_Online extends Zeze.Arch.Online {
                 arg1 = _b_.ReadString();
                 super.RedirectNotify(_hash_, arg1);
                 return null;
-            }, _result_ -> Zeze.Net.Binary.Empty));
+            }, _result_ -> Zeze.Net.Binary.Empty)); 
     }
 }

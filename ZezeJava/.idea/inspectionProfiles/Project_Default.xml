@@ -1811,6 +1811,7 @@
       <option name="CHECK_NON_CONSTANT_VALUES" value="true" />
     </inspection_tool>
     <inspection_tool class="PatternVariableCanBeUsed" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PbDuplicatedImports" enabled="false" level="WARNING" enabled_by_default="false" />
     <inspection_tool class="PermissionUsageInspection" enabled="false" level="WARNING" enabled_by_default="false" />
     <inspection_tool class="PlaceholderCountMatchesArgumentCount" enabled="true" level="WARNING" enabled_by_default="true" />
     <inspection_tool class="PlatformExtensionReceiverOfInline" enabled="true" level="WARNING" enabled_by_default="true" />
