@@ -2,7 +2,6 @@ package UnitTest.Zeze;
 
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Transaction.Bean;
-import Zeze.Transaction.Log1;
 import Zeze.Transaction.Record;
 import Zeze.Transaction.Transaction;
 import org.junit.Assert;
@@ -24,20 +23,14 @@ public class MyBean extends Bean {
 
 	public int _i;
 
-	private static class MyLog extends Log1<MyBean, Integer> {
+	private static class MyLog extends Zeze.Transaction.Logs.LogInt {
 		public MyLog(MyBean bean, int value) {
-			super(bean, value);
-
-		}
-
-		@Override
-		public long getLogKey() {
-			return getBean().getObjectId();
+			super(bean, 0, value);
 		}
 
 		@Override
 		public void Commit() {
-			((MyBean)getBean())._i = getValue();
+			((MyBean)getBean())._i = Value;
 		}
 	}
 
@@ -46,7 +39,7 @@ public class MyBean extends Bean {
 		if (null == txn)
 			return _i;
 		MyBean.MyLog log = (MyBean.MyLog)txn.GetLog(this.getObjectId());
-		return (null != log) ? log.getValue() : _i;
+		return (null != log) ? log.Value : _i;
 	}
 
 	public final void setI(int value) {

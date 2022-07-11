@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Threading.Tasks;
+using NLog;
 using Zeze.Serialize;
 using Zeze.Transaction;
 using Zeze.Util;
@@ -23,7 +24,7 @@ namespace Zeze.Net
         public Func<Protocol, Task<long>> ResponseHandle { get; set; }
         public int Timeout { get; set; } = 5000;
 
-        public TaskCompletionSource<TResult> Future { get; private set; }
+        public TaskCompletionSource<TResult> Future { get; internal set; }
 
         public Rpc()
         {
@@ -156,11 +157,11 @@ namespace Zeze.Net
 
         private bool SendResultDone = false; // XXX ugly
 
-        public virtual void SendResult(Binary result = null)
+        public override void SendResult(Binary result = null)
         {
             if (SendResultDone)
             {
-                logger.Log(Service.SocketOptions.SocketLogLevel, $"Rpc.SendResult Done {Sender.Socket} {this}");
+                logger.Log(LogLevel.Error, $"Rpc.SendResult Already Done {Sender.Socket} {this}");
                 return;
             }
             SendResultDone = true;
@@ -173,19 +174,13 @@ namespace Zeze.Net
             }
         }
 
-        public override void SendResultCode(long code, Binary result = null)
+        public override bool TrySendResultCode(long code)
         {
             if (SendResultDone)
-                return;
-            SendResultDone = true;
-
-            ResultEncoded = result;
+                return false;
             ResultCode = code;
-            IsRequest = false;
-            if (false == base.Send(Sender))
-            {
-                logger.Log(Service.SocketOptions.SocketLogLevel, $"Rpc.SendResult Failed {Sender.Socket} {this}");
-            }
+            SendResult();
+            return true;
         }
 
         internal override void Dispatch(Service service, Service.ProtocolFactoryHandle factoryHandle)

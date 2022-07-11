@@ -58,6 +58,11 @@
 	</module>
 
 	<module name="Friend" id="2">
+		<enum name="ErrorDepartmentNotFound" value="1"/>
+		<enum name="ErrorFriendNodeNotFound" value="2"/>
+		<enum name="ErrorMemberNodeNotFound" value="3"/>
+		<enum name="ErrorDeparmentMemberNotInGroup" value="4"/>
+
 		<!-- 好友列表用 Zeze.Collections.LinkedMap -->
 		<bean name="BFriend">
 			<variable id="1" name="Account" type="string"/>
@@ -156,6 +161,12 @@
 		</bean>
 		<rpc name="GetDepartmentMemberNode" argument="BDepartmentNodeId" result="BDepartmentMemberNode" handle="server"/>
 
+		<bean name="BAddDepartmentMember">
+			<variable id="1" name="Group" type="string"/>
+			<variable id="2" name="DepartmentId" type="long"/>
+			<variable id="3" name="Account" type="string"/>
+		</bean>
+		<rpc name="AddDepartmentMember" argument="BAddDepartmentMember" handle="server"/>
 	</module>
 
 	<module name="Message" id="3">
@@ -200,6 +211,7 @@
 			<variable id="3" name="SecureMessage" type="binary" />
 			<variable id="4" name="From"          type="string" /> 发送用户，服务器填写
 			<variable id="5" name="Group"         type="string" /> 群消息才填写，服务器填写，
+			<variable id="6" name="DepartmentId"   type="long" /> 群消息才填写，服务器填写。
 		</bean>
 		
 		<!-- 好友消息历史 -->

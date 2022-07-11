@@ -28,6 +28,7 @@ import Zeze.Services.ServiceManager.SubscribeInfo;
 import Zeze.Services.ServiceManager.UnRegister;
 import Zeze.Services.ServiceManager.UnSubscribe;
 import Zeze.Services.ServiceManager.Update;
+import Zeze.Transaction.DatabaseRocksDb;
 import Zeze.Transaction.Procedure;
 import Zeze.Util.ConcurrentHashSet;
 import Zeze.Util.LongConcurrentHashMap;
@@ -36,12 +37,12 @@ import Zeze.Util.LongList;
 import Zeze.Util.Random;
 import Zeze.Util.Task;
 import Zeze.Util.TaskOneByOneByKey;
+import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.rocksdb.Options;
+import org.apache.logging.log4j.core.LoggerContext;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
-import org.rocksdb.WriteOptions;
 import org.w3c.dom.Element;
 
 /**
@@ -90,6 +91,12 @@ import org.w3c.dom.Element;
  * 原则是：总按最新的gs-list通告。中间不一致的ready全部忽略。
  */
 public final class ServiceManagerServer implements Closeable {
+	static {
+		System.setProperty("log4j.configurationFile", "log4j2.xml");
+		var level = Level.toLevel(System.getProperty("logLevel"), Level.INFO);
+		((LoggerContext)LogManager.getContext(false)).getConfiguration().getRootLogger().setLevel(level);
+	}
+
 	private static final Logger logger = LogManager.getLogger(ServiceManagerServer.class);
 
 	// ServiceInfo.Name -> ServiceState
@@ -140,7 +147,6 @@ public final class ServiceManagerServer implements Closeable {
 	private NetServer Server;
 	private final AsyncSocket ServerSocket;
 	private final RocksDB AutoKeysDb;
-	private final WriteOptions WriteOptions;
 	private final ConcurrentHashMap<String, AutoKey> AutoKeys = new ConcurrentHashMap<>();
 	private volatile Future<?> StartNotifyDelayTask;
 
@@ -254,23 +260,33 @@ public final class ServiceManagerServer implements Closeable {
 				return;
 			var notify = new NotifyServiceList();
 			notify.Argument = new ServiceInfos(ServiceName, this, ++SerialId);
-			logger.debug("StartNotify {}", notify.Argument);
 			var notifyBytes = notify.Encode();
-
+			var sb = new StringBuilder();
 			if (notifySimple) {
 				for (var it = Simple.keyIterator(); it.hasNext(); ) {
 					var s = ServiceManager.Server.GetSocket(it.next());
-					if (s != null)
+					if (s != null) {
 						s.Send(notifyBytes);
+						sb.append(s.getSessionId()).append(',');
+					}
 				}
 			}
-
+			var n = sb.length();
+			if (n > 0)
+				sb.setCharAt(n - 1, ';');
+			else
+				sb.append(';');
 			for (var it = ReadyCommit.entryIterator(); it.moveToNext(); ) {
 				it.value().setReady(false);
 				var s = ServiceManager.Server.GetSocket(it.key());
-				if (s != null)
+				if (s != null) {
 					s.Send(notifyBytes);
+					sb.append(s.getSessionId()).append(',');
+				}
 			}
+			if (sb.length() > 1)
+				AsyncSocket.logger.info("SEND[{}]: NotifyServiceList: {}", sb, notify.Argument);
+
 			if (!ReadyCommit.isEmpty()) {
 				// 只有两段公告模式需要回应处理。
 				if (NotifyTimeoutTask != null)
@@ -286,18 +302,36 @@ public final class ServiceManagerServer implements Closeable {
 		}
 
 		public synchronized void NotifySimpleOnRegister(ServiceInfo info) {
+			var sb = new StringBuilder();
 			for (var it = Simple.keyIterator(); it.hasNext(); ) {
+				var sessionId = it.next();
+				sb.append(sessionId).append(',');
 				var r = new Register();
 				r.Argument = info;
-				r.Send(ServiceManager.Server.GetSocket(it.next()));
+				r.Send(ServiceManager.Server.GetSocket(sessionId));
+			}
+			var n = sb.length();
+			if (n > 0) {
+				sb.setLength(n - 1);
+				logger.info("NotifySimpleOnRegister {} id({}) => sid({})",
+						info.getServiceName(), info.getServiceIdentity(), sb);
 			}
 		}
 
 		public synchronized void NotifySimpleOnUnRegister(ServiceInfo info) {
+			var sb = new StringBuilder();
 			for (var it = Simple.keyIterator(); it.hasNext(); ) {
+				var sessionId = it.next();
+				sb.append(sessionId).append(',');
 				var r = new UnRegister();
 				r.Argument = info;
-				r.Send(ServiceManager.Server.GetSocket(it.next()));
+				r.Send(ServiceManager.Server.GetSocket(sessionId));
+			}
+			var n = sb.length();
+			if (n > 0) {
+				sb.setLength(n - 1);
+				logger.info("NotifySimpleOnUnRegister {} id({}) => sid({})",
+						info.getServiceName(), info.getServiceIdentity(), sb);
 			}
 		}
 
@@ -311,16 +345,29 @@ public final class ServiceManagerServer implements Closeable {
 			current.setExtraInfo(info.getExtraInfo());
 
 			// 简单广播。
+			var sb = new StringBuilder();
 			for (var it = Simple.keyIterator(); it.hasNext(); ) {
+				var sessionId = it.next();
+				sb.append(sessionId).append(',');
 				var r = new Update();
 				r.Argument = current;
-				r.Send(ServiceManager.Server.GetSocket(it.next()));
+				r.Send(ServiceManager.Server.GetSocket(sessionId));
 			}
+			var n = sb.length();
+			if (n > 0)
+				sb.setCharAt(n - 1, ';');
+			else
+				sb.append(';');
 			for (var it = ReadyCommit.keyIterator(); it.hasNext(); ) {
+				var sessionId = it.next();
+				sb.append(sessionId).append(',');
 				var r = new Update();
 				r.Argument = current;
-				r.Send(ServiceManager.Server.GetSocket(it.next()));
+				r.Send(ServiceManager.Server.GetSocket(sessionId));
 			}
+			if (sb.length() > 1)
+				logger.info("UpdateAndNotify {} id({}) => sid({})",
+						info.getServiceName(), info.getServiceIdentity(), sb);
 			return 0;
 		}
 
@@ -355,16 +402,12 @@ public final class ServiceManagerServer implements Closeable {
 			// 外面会话的 TryAdd 加入成功，下面TryAdd肯定也成功。
 			switch (r.Argument.getSubscribeType()) {
 			case SubscribeInfo.SubscribeTypeSimple:
-				Simple.putIfAbsent(session.getSessionId(), new SubscribeState(session.getSessionId()));
-				if (ServiceManager.StartNotifyDelayTask == null) {
-					var arg = new ServiceInfos(ServiceName, this, SerialId);
-					SubscribeFirstCommit tempVar = new SubscribeFirstCommit();
-					tempVar.Argument = arg;
-					tempVar.Send(r.getSender());
-				}
+				Simple.computeIfAbsent(session.getSessionId(), SubscribeState::new);
+				if (ServiceManager.StartNotifyDelayTask == null)
+					new SubscribeFirstCommit(new ServiceInfos(ServiceName, this, SerialId)).Send(r.getSender());
 				break;
 			case SubscribeInfo.SubscribeTypeReadyCommit:
-				ReadyCommit.putIfAbsent(session.getSessionId(), new SubscribeState(session.getSessionId()));
+				ReadyCommit.computeIfAbsent(session.getSessionId(), SubscribeState::new);
 				StartReadyCommitNotify();
 				break;
 			default:
@@ -392,10 +435,10 @@ public final class ServiceManagerServer implements Closeable {
 
 		public synchronized void SetReady(ReadyServiceList p, Session session) {
 			if (p.Argument.SerialId != SerialId) {
-				logger.debug("Ready Skip: SerialId Not Equal." + p.Argument.SerialId + " Now=" + SerialId);
+				logger.debug("Ready Skip: SerialId Not Equal. {} Now={}", p.Argument.SerialId, SerialId);
 				return;
 			}
-			//logger.debug("Ready:" + p.Argument.SerialId + " Now=" + SerialId);
+			// logger.debug("Ready:{} Now={}", p.Argument.SerialId, SerialId);
 			var subscribeState = ReadyCommit.get(session.getSessionId());
 			if (subscribeState == null)
 				return;
@@ -489,10 +532,6 @@ public final class ServiceManagerServer implements Closeable {
 		}
 	}
 
-	static {
-		System.setProperty("log4j.configurationFile", "log4j2.xml");
-	}
-
 	private void AddLoadObserver(String ip, int port, AsyncSocket sender) {
 		if (ip.isEmpty() || port == 0)
 			return;
@@ -504,10 +543,13 @@ public final class ServiceManagerServer implements Closeable {
 		var session = (Session)r.getSender().getUserState();
 
 		// 允许重复登录，断线重连Agent不好原子实现重发。
-		if (session.getRegisters().add(r.Argument))
-			logger.info("Register {}, {}", r.Argument.getServiceName(), r.Argument.getServiceIdentity());
-		else
-			logger.info("already Registered {}, {}", r.Argument.getServiceName(), r.Argument.getServiceIdentity());
+		if (session.getRegisters().add(r.Argument)) {
+			logger.info("{}: Register {} id={} ip={} port={}", r.getSender(), r.Argument.getServiceName(),
+					r.Argument.getServiceIdentity(), r.Argument.getPassiveIp(), r.Argument.getPassivePort());
+		} else {
+			logger.info("{}: already Registered {} id={} ip={} port={}", r.getSender(), r.Argument.getServiceName(),
+					r.Argument.getServiceIdentity(), r.Argument.getPassiveIp(), r.Argument.getPassivePort());
+		}
 		var state = ServerStates.computeIfAbsent(r.Argument.getServiceName(), name -> new ServerState(this, name));
 
 		// 【警告】
@@ -516,7 +558,7 @@ public final class ServiceManagerServer implements Closeable {
 		// 在目前没有问题，因为r.Argument主要记录在state.ServiceInfos中，
 		// 另外它也被Session引用（用于连接关闭时，自动注销）。
 		// 这是专用程序，不是一个库，以后有修改时，小心就是了。
-		r.Argument.setLocalState(r.getSender().getSessionId());
+		r.Argument.SessionId = r.getSender().getSessionId();
 
 		// AddOrUpdate，否则重连重新注册很难恢复到正确的状态。
 		state.ServiceInfos.put(r.Argument.getServiceIdentity(), r.Argument);
@@ -527,6 +569,8 @@ public final class ServiceManagerServer implements Closeable {
 	}
 
 	private long ProcessUpdate(Update r) {
+		logger.info("{}: Update {} id={} ip={} port={}", r.getSender(), r.Argument.getServiceName(),
+				r.Argument.getServiceIdentity(), r.Argument.getPassiveIp(), r.Argument.getPassivePort());
 		var session = (Session)r.getSender().getUserState();
 		if (!session.Registers.containsKey(r.Argument))
 			return Update.ServiceNotRegister;
@@ -548,7 +592,7 @@ public final class ServiceManagerServer implements Closeable {
 			var exist = state.ServiceInfos.get(info.getServiceIdentity());
 			if (exist != null) {
 				// 这里存在一个时间窗口，可能使得重复的注销会成功。注销一般比较特殊，忽略这个问题。
-				Long existSessionId = (Long)exist.getLocalState();
+				var existSessionId = exist.SessionId;
 				if (existSessionId == null || sessionId == existSessionId) {
 					// 有可能当前连接没有注销，新的注册已经AddOrUpdate，此时忽略当前连接的注销。
 					if (state.ServiceInfos.remove(info.getServiceIdentity(), exist)) {
@@ -562,6 +606,8 @@ public final class ServiceManagerServer implements Closeable {
 	}
 
 	private long ProcessUnRegister(UnRegister r) {
+		logger.info("{}: UnRegister {} id={}",
+				r.getSender(), r.Argument.getServiceName(), r.Argument.getServiceIdentity());
 		if (UnRegisterNow(r.getSender().getSessionId(), r.Argument) != null) {
 			// ignore TryRemove failed.
 			var session = (Session)r.getSender().getUserState();
@@ -575,10 +621,11 @@ public final class ServiceManagerServer implements Closeable {
 	}
 
 	private long ProcessSubscribe(Subscribe r) {
+		logger.info("{}: Subscribe {} type={}",
+				r.getSender(), r.Argument.getServiceName(), r.Argument.getSubscribeType());
 		var session = (Session)r.getSender().getUserState();
 		session.getSubscribes().putIfAbsent(r.Argument.getServiceName(), r.Argument);
-		var state = ServerStates.computeIfAbsent(r.Argument.getServiceName(),
-				name -> new ServerState(this, name));
+		var state = ServerStates.computeIfAbsent(r.Argument.getServiceName(), name -> new ServerState(this, name));
 		return state.SubscribeAndSend(r, session);
 	}
 
@@ -600,6 +647,8 @@ public final class ServiceManagerServer implements Closeable {
 	}
 
 	private long ProcessUnSubscribe(UnSubscribe r) {
+		logger.info("{}: UnSubscribe {} type={}",
+				r.getSender(), r.Argument.getServiceName(), r.Argument.getSubscribeType());
 		var session = (Session)r.getSender().getUserState();
 		var sub = session.getSubscribes().remove(r.Argument.getServiceName());
 		if (sub != null) {
@@ -630,7 +679,8 @@ public final class ServiceManagerServer implements Closeable {
 	}
 
 	private long ProcessSetLoad(SetServerLoad setServerLoad) {
-		Loads.computeIfAbsent(setServerLoad.Argument.getName(), (key) -> new LoadObservers(this)).SetLoad(setServerLoad.Argument);
+		Loads.computeIfAbsent(setServerLoad.Argument.getName(), __ -> new LoadObservers(this))
+				.SetLoad(setServerLoad.Argument);
 		return 0;
 	}
 
@@ -647,7 +697,8 @@ public final class ServiceManagerServer implements Closeable {
 		this(ipaddress, port, config, -1);
 	}
 
-	public ServiceManagerServer(InetAddress ipaddress, int port, Zeze.Config config, int startNotifyDelay) throws Throwable {
+	public ServiceManagerServer(InetAddress ipaddress, int port, Zeze.Config config, int startNotifyDelay)
+			throws Throwable {
 		Config = config.GetCustomize(new Conf());
 
 		if (startNotifyDelay >= 0)
@@ -685,10 +736,7 @@ public final class ServiceManagerServer implements Closeable {
 		if (Config.getStartNotifyDelay() > 0)
 			StartNotifyDelayTask = Task.schedule(Config.getStartNotifyDelay(), this::StartNotifyAll);
 
-		var options = new Options().setCreateIfMissing(true);
-
-		AutoKeysDb = RocksDB.open(options, Paths.get(Config.getDbHome(), "autokeys").toString());
-		WriteOptions = new WriteOptions().setSync(true);
+		AutoKeysDb = RocksDB.open(DatabaseRocksDb.getCommonOptions(), Paths.get(Config.getDbHome(), "autokeys").toString());
 
 		// 允许配置多个acceptor，如果有冲突，通过日志查看。
 		ServerSocket = Server.NewServerSocket(ipaddress, port, null);
@@ -764,7 +812,7 @@ public final class ServiceManagerServer implements Closeable {
 			var bb = ByteBuffer.Allocate(ByteBuffer.writeLongSize(current));
 			bb.WriteLong(current);
 			try {
-				SMS.AutoKeysDb.put(SMS.WriteOptions, getKey(), bb.Bytes);
+				SMS.AutoKeysDb.put(DatabaseRocksDb.getSyncWriteOptions(), getKey(), bb.Bytes);
 			} catch (RocksDBException e) {
 				throw new RuntimeException(e);
 			}
@@ -783,8 +831,8 @@ public final class ServiceManagerServer implements Closeable {
 
 	private void StartNotifyAll() {
 		StartNotifyDelayTask = null;
-		for (var e : ServerStates.entrySet())
-			e.getValue().StartReadyCommitNotify(true);
+		for (var v : ServerStates.values())
+			v.StartReadyCommitNotify(true);
 	}
 
 	public synchronized void Stop() throws Throwable {
@@ -818,12 +866,14 @@ public final class ServiceManagerServer implements Closeable {
 
 		@Override
 		public void OnSocketAccept(AsyncSocket so) throws Throwable {
+			logger.info("OnSocketAccept: {} sid={}", so, so.getSessionId());
 			so.setUserState(new Session(ServiceManager, so.getSessionId()));
 			super.OnSocketAccept(so);
 		}
 
 		@Override
 		public void OnSocketClose(AsyncSocket so, Throwable e) throws Throwable {
+			logger.info("OnSocketClose: {} sid={}", so, so.getSessionId());
 			var session = (Session)so.getUserState();
 			if (session != null)
 				session.OnClose();
@@ -834,7 +884,7 @@ public final class ServiceManagerServer implements Closeable {
 		public <P extends Protocol<?>> void DispatchProtocol(P p, ProtocolFactoryHandle<P> factoryHandle) {
 			if (factoryHandle.Handle != null) {
 				oneByOneByKey.Execute(p.getSender(),
-						() -> Task.Call(() -> factoryHandle.Handle.handle(p), p, Protocol::SendResultCode));
+						() -> Task.Call(() -> factoryHandle.Handle.handle(p), p, Protocol::trySendResultCode));
 			}
 		}
 	}

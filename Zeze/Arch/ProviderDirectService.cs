@@ -13,7 +13,7 @@ namespace Zeze.Arch
 {
 	public class ProviderDirectService : Zeze.Services.HandshakeBoth
 	{
-		private static readonly NLog.Logger logger = NLog.LogManager.GetCurrentClassLogger();
+		//private static readonly NLog.Logger logger = NLog.LogManager.GetCurrentClassLogger();
 		public ProviderApp ProviderApp;
 		public readonly ConcurrentDictionary<string, ProviderSession> ProviderByLoadName = new();
 		public readonly ConcurrentDictionary<int, ProviderSession> ProviderByServerId = new();
@@ -23,41 +23,74 @@ namespace Zeze.Arch
 		{
 		}
 
-		public void TryConnectAndSetReady(Agent.SubscribeState ss, ServiceInfos infos)
+		public void RemoveServer(Agent.SubscribeState ss, ServiceInfo pm)
 		{
 			lock (this)
 			{
-				foreach (var pm in infos.SortedIdentity)
+				var connName = pm.PassiveIp + ":" + pm.PassivePort;
+				var conn = Config.FindConnector(connName);
+				if (null != conn)
 				{
-					var connName = pm.PassiveIp + ":" + pm.PassivePort;
-					if (ProviderByLoadName.TryGetValue(connName, out var ps))
-					{
-						// connection has ready.
-						var mid = int.Parse(infos.ServiceName.Split('#')[1]);
-						if (false == ProviderApp.Modules.TryGetValue(mid, out var m))
-							throw new Exception($"Module Not Found {mid}");
-						SetReady(ss, pm, ps, mid, m);
-						continue;
-					}
-					var serverId = int.Parse(pm.Identity);
-					if (serverId < Zeze.Config.ServerId)
-						continue;
-					if (serverId == Zeze.Config.ServerId)
-					{
-						var psLocal = new ProviderSession();
-						psLocal.ServerId = serverId;
-						SetRelativeServiceReady(psLocal, ProviderApp.DirectIp, ProviderApp.DirectPort);
-						continue;
-					}
-					if (Config.TryGetOrAddConnector(pm.PassiveIp, pm.PassivePort, true, out var newAdd))
-					{
-						// 新建的Connector。开始连接。
-						var psPeer = new ProviderSession();
-						psPeer.ServerId = serverId;
-						newAdd.UserState = psPeer;
-						newAdd.Start();
-					}
+					conn.Stop();
+					ProviderByLoadName.TryRemove(connName, out _);
+					ProviderByServerId.TryRemove(int.Parse(pm.ServiceIdentity), out _);
+					ss.SetServiceIdentityReadyState(pm.ServiceIdentity, null);
+					Config.RemoveConnector(conn);
 				}
+			}
+		}
+
+		public void AddServer(Agent.SubscribeState ss, ServiceInfo pm)
+		{
+			lock (this)
+			{
+				var connName = pm.PassiveIp + ":" + pm.PassivePort;
+				if (ProviderByLoadName.TryGetValue(connName, out var ps))
+				{
+					// connection has ready.
+					var mid = int.Parse(pm.ServiceName.Split('#')[1]);
+					if (false == ProviderApp.Modules.TryGetValue(mid, out var m))
+						throw new Exception($"Module Not Found {mid}");
+					SetReady(ss, pm, ps, mid, m);
+					return;
+				}
+				var serverId = int.Parse(pm.ServiceIdentity);
+				if (serverId < Zeze.Config.ServerId)
+					return;
+				if (serverId == Zeze.Config.ServerId)
+				{
+					var psLocal = new ProviderSession
+					{
+						ServerId = serverId
+					};
+					SetRelativeServiceReady(psLocal, ProviderApp.DirectIp, ProviderApp.DirectPort);
+					return;
+				}
+				if (Config.TryGetOrAddConnector(pm.PassiveIp, pm.PassivePort, true, out var newAdd))
+				{
+					// 新建的Connector。开始连接。
+					var psPeer = new ProviderSession
+					{
+						ServerId = serverId
+					};
+					newAdd.UserState = psPeer;
+					newAdd.Start();
+				}
+			}
+		}
+
+		public void TryConnectAndSetReady(Agent.SubscribeState ss, ServiceInfos infos)
+		{
+			var current = new Dictionary<string, ServiceInfo>(); 
+			foreach (var pm in infos.SortedIdentity)
+			{
+				AddServer(ss, pm);
+				current[pm.PassiveIp + ":" + pm.PassivePort] = pm;
+			}
+			Config.ForEachConnector((c) => current.Remove(c.Name, out _));
+			foreach (var pm in current.Values)
+			{
+				RemoveServer(ss, pm);
 			}
 		}
 
@@ -65,10 +98,12 @@ namespace Zeze.Arch
         {
 			if (socket.Connector == null)
             {
-				// 被动连接等待对方报告信息时再处理。
-				var ps = new ProviderSession();
-				ps.SessionId = socket.SessionId;
-				socket.UserState = ps;
+                // 被动连接等待对方报告信息时再处理。
+                var ps = new ProviderSession
+                {
+                    SessionId = socket.SessionId
+                };
+                socket.UserState = ps;
 			}
 			base.OnSocketAccept(socket);
         }
@@ -129,10 +164,10 @@ namespace Zeze.Arch
 		private void SetReady(Agent.SubscribeState ss, ServiceInfo server, ProviderSession ps,
 			int mid, Zeze.Builtin.Provider.BModule m)
 		{
-			Console.WriteLine($"SetReady Server={Zeze.Config.ServerId} {ss.ServiceName} {server.Identity}");
+			Console.WriteLine($"SetReady Server={Zeze.Config.ServerId} {ss.ServiceName} {server.ServiceIdentity}");
 			var pms = new ProviderModuleState(ps.SessionId, mid, m.ChoiceType, m.ConfigType);
-			ps.GetOrAddServiceReadyState(ss.ServiceName).TryAdd(server.Identity, pms);
-			ss.SetServiceIdentityReadyState(server.Identity, pms);
+			ps.GetOrAddServiceReadyState(ss.ServiceName).TryAdd(server.ServiceIdentity, pms);
+			ss.SetServiceIdentityReadyState(server.ServiceIdentity, pms);
 		}
 
 		public override void OnSocketClose(AsyncSocket socket, Exception ex)
@@ -158,18 +193,13 @@ namespace Zeze.Arch
 
 		public override void DispatchProtocol(Protocol p, ProtocolFactoryHandle factoryHandle)
 		{
-			// 防止Client不进入加密，直接发送用户协议。
-			if (!IsHandshakeProtocol(p.TypeId)) {
-				p.Sender?.VerifySecurity();
-			}
-
 			if (p.TypeId == ModuleRedirect.TypeId_)
 			{
 				var r = (ModuleRedirect)p;
 				// 总是不启用存储过程，内部处理redirect时根据Redirect.Handle配置决定是否在存储过程中执行。
 				Zeze.TaskOneByOneByKey.Execute(
 					r.Argument.HashCode, factoryHandle.Handle, p, r.Argument.MethodFullName,
-					(p, code) => p.SendResultCode(code));
+					(p, code) => p.TrySendResultCode(code));
 
 				return;
 			}
@@ -178,13 +208,13 @@ namespace Zeze.Arch
 			{
 				var r = (ModuleRedirectAllResult)p;
 				// 总是不启用存储过程，内部处理redirect时根据Redirect.Handle配置决定是否在存储过程中执行。
-				_ = Mission.CallAsync(factoryHandle.Handle, p, (p, code) => p.SendResultCode(code), r.Argument.MethodFullName);
+				_ = Mission.CallAsync(factoryHandle.Handle, p, (p, code) => p.TrySendResultCode(code), r.Argument.MethodFullName);
 
 				return;
 			}
 			// 所有的ProviderDirectService都不启用存储过程。
 			// 按收到顺序处理，不并发。这样也避免线程切换。
-			_ = Mission.CallAsync(factoryHandle.Handle, p, (p, code) => p.SendResultCode(code));
+			_ = Mission.CallAsync(factoryHandle.Handle, p, (p, code) => p.TrySendResultCode(code));
 		}
 
 		public override void DispatchRpcResponse(Protocol rpc, Func<Protocol, Task<long>> responseHandle, ProtocolFactoryHandle factoryHandle)

@@ -18,7 +18,33 @@ namespace Zeze.Net
 
         public string HostNameOrAddress { get; }
         public int Port { get; } = 0;
-        public bool IsAutoReconnect { get; set; } = true;
+        private volatile bool autoReconnect = true;
+        public bool AutoReconnect
+        {
+            get
+            {
+                return autoReconnect;
+            }
+            set
+            {
+                autoReconnect = value;
+                if (autoReconnect)
+                {
+                    TryReconnect();
+                }
+                else
+                {
+                    lock (this)
+                    {
+                        if (ReconnectTask != null)
+                        {
+                            ReconnectTask.Cancel();
+                            ReconnectTask = null;
+                        }
+                    }
+                }
+            }
+        }
         public bool IsConnected { get; private set; } = false;
         public bool IsHandshakeDone => TryGetReadySocket() != null;
         private volatile TaskCompletionSource<AsyncSocket> FutureSocket = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -44,12 +70,13 @@ namespace Zeze.Net
         }
         private int ReConnectDelay;
         public Util.SchedulerTask ReconnectTask { get; private set; }
+        public int ReadyTimeout { get; set; } = 5000;
 
         public Connector(string host, int port = 0, bool autoReconnect = true)
         {
             HostNameOrAddress = host;
             Port = port;
-            IsAutoReconnect = autoReconnect;
+            AutoReconnect = autoReconnect;
         }
 
         public static Connector Create(XmlElement e)
@@ -68,7 +95,7 @@ namespace Zeze.Net
             HostNameOrAddress = self.GetAttribute("HostNameOrAddress");
             attr = self.GetAttribute("IsAutoReconnect");
             if (attr.Length > 0)
-                IsAutoReconnect = bool.Parse(attr);
+                AutoReconnect = bool.Parse(attr);
             attr = self.GetAttribute("MaxReconnectDelay");
             if (attr.Length > 0)
                 MaxReconnectDelay = int.Parse(attr) * 1000;
@@ -87,15 +114,15 @@ namespace Zeze.Net
         public AsyncSocket GetReadySocket()
         {
             var task = GetReadySocketAsync();
-            task.Wait();
-            return task.Result;
+            if (task.Wait(ReadyTimeout))
+                return task.Result;
+            throw new Exception("GetReadySocket Timeout.");
         }
 
         public async Task<AsyncSocket> GetReadySocketAsync()
         {
             var volatileTmp = FutureSocket;
-            await volatileTmp.Task;
-            return volatileTmp.Task.Result;
+            return await volatileTmp.Task.WaitAsync(TimeSpan.FromMilliseconds(ReadyTimeout));
         }
 
         public virtual AsyncSocket TryGetReadySocket()
@@ -149,7 +176,7 @@ namespace Zeze.Net
         {
             lock (this)
             {
-                if (false == IsAutoReconnect
+                if (false == AutoReconnect
                     || null != Socket
                     || null != ReconnectTask)
                 {

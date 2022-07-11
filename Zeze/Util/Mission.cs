@@ -9,6 +9,8 @@ namespace Zeze.Util
     {
         private static readonly NLog.Logger logger = NLog.LogManager.GetCurrentClassLogger();
 
+        // 任何任务执行异常都会设置这个，用于单元测试程序报错用。
+
         public static async Task AwaitNullableTask(Task task)
         {
             if (null != task)
@@ -24,6 +26,13 @@ namespace Zeze.Util
             catch (Exception ex)
             {
                 logger.Error(ex, actionName);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
                 return Procedure.Exception;
             }
         }
@@ -37,6 +46,13 @@ namespace Zeze.Util
             catch (Exception ex)
             {
                 logger.Error(ex, actionName);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
             }
         }
 
@@ -69,6 +85,11 @@ namespace Zeze.Util
             logger.Log(ll, ex, $"Return={result}{module} {message}");
         }
 
+        public static async Task<long> CallAsync(Func<Task> aa, string actionName)
+        {
+            return await CallAsync(async () => { await aa(); return 0; }, actionName);
+        }
+
         public static async Task<long> CallAsync(Func<Task<long>> aa, string actionName)
         {
             try
@@ -78,6 +99,13 @@ namespace Zeze.Util
             catch (Exception ex)
             {
                 logger.Error(ex, actionName);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
                 return Procedure.Exception;
             }
         }
@@ -105,7 +133,6 @@ namespace Zeze.Util
                         break;
                     ex = inner;
                 }
-
                 var errorCode = Procedure.Exception;
                 if (ex is TaskCanceledException)
                     errorCode = Procedure.CancelException;
@@ -116,6 +143,13 @@ namespace Zeze.Util
                     actionWhenError?.Invoke(p, errorCode);
                 // use last inner cause
                 LogAndStatistics(ex, errorCode, p, IsRequestSaved, name);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
                 return errorCode;
             }
         }
@@ -154,6 +188,13 @@ namespace Zeze.Util
                     actionWhenError?.Invoke(p, errorCode);
                 // use last inner cause
                 LogAndStatistics(ex, errorCode, p, IsRequestSaved);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
                 return errorCode;
             }
         }
@@ -177,12 +218,19 @@ namespace Zeze.Util
             }
             catch (Exception ex)
             {
-                // Procedure.Call处理了所有错误。除非内部错误，不会到这里。
+                // Procedure.Call处理了所有错误。除非内部错误或者单元测试异常，不会到这里。
                 if (null != isRequestSaved && isRequestSaved.Value)
                 {
                     actionWhenError?.Invoke(from, Procedure.Exception);
                 }
                 LogAction?.Invoke(NLog.LogLevel.Error, ex, Procedure.Exception, procedure.ActionName);
+#if DEBUG
+                // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                if (ex.GetType().Name == "AssertFailedException")
+                {
+                    throw;
+                }
+#endif
                 return Procedure.Exception;
             }
         }

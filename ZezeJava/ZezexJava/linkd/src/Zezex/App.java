@@ -4,9 +4,9 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import Zeze.Net.AsyncSocket;
 import Zeze.Util.PersistentAtomicLong;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import Zeze.Arch.*;
 import Zeze.Config;
+import org.tikv.shade.com.fasterxml.jackson.databind.ObjectMapper;
 
 public final class App extends Zeze.AppBase {
 	public static final App Instance = new App();
@@ -69,7 +69,8 @@ public final class App extends Zeze.AppBase {
 
 	public void Stop() throws Throwable {
 		StopService(); // 关闭网络
-		Zeze.Stop(); // 关闭数据库
+		if (Zeze != null)
+			Zeze.Stop(); // 关闭数据库
 		StopModules(); // 关闭模块，卸载配置什么的。
 		DestroyModules();
 		DestroyServices();

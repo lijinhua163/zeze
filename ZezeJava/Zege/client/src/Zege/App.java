@@ -5,7 +5,7 @@ import Zeze.Net.Connector;
 import Zeze.Util.OutObject;
 
 public class App extends Zeze.AppBase {
-    public static App Instance = new App();
+    public static final App Instance = new App();
     public static App getInstance() {
         return Instance;
     }
@@ -15,9 +15,9 @@ public class App extends Zeze.AppBase {
         var config = Config.Load("client.xml");
         CreateZeze(config);
         CreateService();
-        if (null != ip && false == ip.isEmpty() && port != 0) {
+        if (null != ip && !ip.isEmpty() && port != 0) {
             var c = new OutObject<Connector>();
-            ClientService.getConfig().TryGetOrAddConnector(ip, port, true, c);
+            ClientService.getConfig().TryGetOrAddConnector(ip, port, false, c);
             Connector = c.Value;
         } else {
             ClientService.getConfig().forEachConnector2((c) -> { Connector = c; return false; });
@@ -34,7 +34,8 @@ public class App extends Zeze.AppBase {
     public void Stop() throws Throwable {
         StopService(); // 关闭网络
         StopModules(); // 关闭模块，卸载配置什么的。
-        Zeze.Stop(); // 关闭数据库
+        if (Zeze != null)
+            Zeze.Stop(); // 关闭数据库
         DestroyModules();
         DestroyServices();
         DestroyZeze();

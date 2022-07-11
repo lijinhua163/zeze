@@ -126,14 +126,29 @@ public abstract class Protocol<TArgument extends Bean> implements Serializable {
 		return so != null && Send(so);
 	}
 
-	// 用于Rpc自动发送结果。
+	// 用于Rpc发送结果。
 	// Rpc会重载实现。
-	public void SendResultCode(long code) {
-		ResultCode = code;
+	public void SendResult(Binary result) {
 	}
 
-	public void SendResultCode(long code, @SuppressWarnings("unused") Binary result) {
-		ResultCode = code;
+	// Rpc 发送结果辅助函数。
+	public final void SendResult() {
+		SendResult(null);
+	}
+
+	// 用于Rpc发送结果。
+	// Rpc会重载实现。
+	public boolean trySendResultCode(long code) {
+		return false;
+	}
+
+	public final void SendResultCode(long code) {
+		SendResultCode(code, null);
+	}
+
+	public final void SendResultCode(long code, @SuppressWarnings("unused") Binary result) {
+		setResultCode(code);
+		SendResult(result);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -188,17 +203,21 @@ public abstract class Protocol<TArgument extends Bean> implements Serializable {
 				if (AsyncSocket.ENABLE_PROTOCOL_LOG) {
 					if (p.isRequest()) {
 						if (p instanceof Rpc)
-							AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV({}) {}({}): {}", so.getSessionId(),
+							AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV[{}] {}({}): {}", so.getSessionId(),
 									p.getClass().getSimpleName(), ((Rpc<?, ?>)p).getSessionId(), p.Argument);
 						else
-							AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV({}) {}: {}", so.getSessionId(),
+							AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV[{}] {}: {}", so.getSessionId(),
 									p.getClass().getSimpleName(), p.Argument);
 					} else
-						AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV({}) {}({})>{} {}", so.getSessionId(),
+						AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV[{}] {}({})>{} {}", so.getSessionId(),
 								p.getClass().getSimpleName(), ((Rpc<?, ?>)p).getSessionId(), p.ResultCode, p.getResultBean());
 				}
 				p.Dispatch(service, factoryHandle);
 			} else {
+				if (AsyncSocket.ENABLE_PROTOCOL_LOG) {
+					AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "RECV[{}] {}:{} [{}]",
+							so.getSessionId(), moduleId, protocolId, bb.Size());
+				}
 				int savedWriteIndex = bb.WriteIndex;
 				bb.WriteIndex = endReadIndex;
 				service.DispatchUnknownProtocol(so, moduleId, protocolId, bb); // 这里只能临时读bb,不能持有Bytes引用

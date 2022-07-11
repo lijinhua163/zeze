@@ -5,6 +5,7 @@ using Zeze.Serialize;
 using System.Collections.Concurrent;
 using Zeze.Services;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace Zeze.Transaction
 {
@@ -33,8 +34,8 @@ namespace Zeze.Transaction
         private long _Timestamp; // CS0677 volatile cannot apply to long
         internal long Timestamp
         {
-            get { return _Timestamp; }
-            set { _Timestamp = value; }
+            get { return Interlocked.Read(ref _Timestamp); }
+            set { Interlocked.Exchange(ref _Timestamp, value); }
         }
 
         /// <summary>
@@ -60,7 +61,6 @@ namespace Zeze.Transaction
             get { return _State; }
             set { _State = value; }
         }
-        internal long LastErrorGlobalSerialId { get; set; }
 
         public abstract Table Table { get; }
         private volatile RelativeRecordSet RelativeRecordSetPrivate = new();
@@ -86,7 +86,7 @@ namespace Zeze.Transaction
 
         internal abstract void Commit(Transaction.RecordAccessed accessed);
 
-        internal abstract Task<(long, int, long)> Acquire(int state);
+        internal abstract Task<(long, int)> Acquire(int state, bool fresh);
 
         internal abstract void Encode0();
         internal abstract Task Flush(Database.ITransaction t);
@@ -95,6 +95,25 @@ namespace Zeze.Transaction
         internal Database.ITransaction DatabaseTransactionTmp { get; set; }
         internal abstract void SetDirty();
         internal Nito.AsyncEx.AsyncLock Mutex = new();
+
+        internal bool fresh;
+        private long acquireTime;
+
+        public void SetNotFresh()
+        {
+            fresh = false;
+        }
+
+        public void SetFreshAcquire()
+        {
+            acquireTime = Util.Time.NowUnixMillis;
+            fresh = true;
+        }
+
+        public bool IsFreshAcquire()
+        {
+            return fresh && Util.Time.NowUnixMillis - acquireTime < 1000;
+        }
     }
 
     public class Record<K, V> : Record where V : Bean, new()
@@ -118,12 +137,12 @@ namespace Zeze.Transaction
             // 记录的log可能在Transaction.AddRecordAccessed之前进行，不能再访问了。
         }
 
-        internal async override Task<(long, int, long)> Acquire(int state)
+        internal async override Task<(long, int)> Acquire(int state, bool fresh)
         {
             if (null == TTable.TStorage)
             {
                 // 不支持内存表cache同步。
-                return (0, state, 0);
+                return (0, state);
             }
 
             var gkey = TTable.EncodeGlobalKey(Key);
@@ -145,7 +164,7 @@ namespace Zeze.Transaction
                     break;
             }
 #endif
-            return await TTable.Zeze.GlobalAgent.Acquire(gkey, state);
+            return await TTable.Zeze.GlobalAgent.Acquire(gkey, state, fresh);
         }
 
         internal long SavedTimestampForCheckpointPeriod { get; set; }
@@ -310,6 +329,16 @@ namespace Zeze.Transaction
         { 
             get { return _LruNode; }
             set { _LruNode = value; }
+        }
+        
+        public ConcurrentDictionary<K, Record<K, V>> GetAndSetLruNodeNull()
+        {
+            return Interlocked.Exchange(ref _LruNode, null);
+        }
+
+        public bool CompareAndSetLruNodeNull(ConcurrentDictionary<K, Record<K, V>> c)
+        {
+            return Interlocked.CompareExchange(ref _LruNode, null, c) == c;
         }
     }
 }

@@ -1,6 +1,8 @@
 package Zeze.Raft.RocksRaft;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.SerializeHelper;
@@ -28,10 +30,10 @@ public final class Record<K> {
 
 	public static final int StateNew = 0;
 	public static final int StateLoad = 1;
-	private static final AtomicLong _TimestampGen = new AtomicLong();
+	private static final AtomicLong _TimestampGen = new AtomicLong(1);
 
 	public static long getNextTimestamp() {
-		return _TimestampGen.incrementAndGet();
+		return _TimestampGen.getAndIncrement();
 	}
 
 	private final BiConsumer<ByteBuffer, K> keyEncodeFunc;
@@ -41,6 +43,7 @@ public final class Record<K> {
 	private Table<K, ?> Table;
 	private K Key;
 	private Bean Value;
+	final Lock mutex = new ReentrantLock();
 
 	public Record(Class<K> keyClass) {
 		keyEncodeFunc = SerializeHelper.createEncodeFunc(keyClass);

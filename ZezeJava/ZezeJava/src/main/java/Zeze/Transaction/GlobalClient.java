@@ -1,8 +1,11 @@
 package Zeze.Transaction;
 
-import Zeze.Net.*;
-import Zeze.*;
-import Zeze.Services.GlobalCacheManager.*;
+import Zeze.Application;
+import Zeze.Net.AsyncSocket;
+import Zeze.Net.Protocol;
+import Zeze.Services.GlobalCacheManager.Login;
+import Zeze.Services.GlobalCacheManager.ReLogin;
+import Zeze.Util.Task;
 
 public final class GlobalClient extends Zeze.Net.Service {
 	public GlobalClient(GlobalAgent agent, Application zeze) throws Throwable {
@@ -22,17 +25,28 @@ public final class GlobalClient extends Zeze.Net.Service {
 			reLogin.Send(so, (ThisRpc) -> {
 				logger.debug("GlobalClient Recv Login. isTimeout={}, resultCode={}",
 						reLogin.isTimeout(), reLogin.getResultCode());
-				if (reLogin.isTimeout() || reLogin.getResultCode() != 0) {
+				if (reLogin.isTimeout()) {
 					so.close();
-				}
-				else {
-					agent.getLoginTimes().incrementAndGet();
+				} else if (reLogin.getResultCode() != 0) {
+					// 清理本地已经分配的记录锁。
+					// 1. 关闭网络。下面两行有点重复，就这样了。
+					so.Close(new Exception("GlobalAgent.ReLogin Fail code=" + reLogin.getResultCode()));
+					so.getConnector().Stop();
+					// 2. 开始清理，由守护线程保护，必须成功。
+					agent.startRelease(getZeze(), () -> {
+						// 3. 重置登录次数，下一次连接成功，会发送Login。
+						agent.getLoginTimes().getAndSet(0);
+						// 4. 开始网络连接。
+						so.getConnector().Start();
+					});
+				} else {
+					agent.getLoginTimes().getAndIncrement();
+					agent.setActiveTime(System.currentTimeMillis());
 					super.OnHandshakeDone(so);
 				}
 				return 0;
 			});
-		}
-		else {
+		} else {
 			var login = new Login();
 			login.Argument.ServerId = getZeze().getConfig().getServerId();
 			login.Argument.GlobalCacheManagerHashIndex = agent.getGlobalCacheManagerHashIndex();
@@ -42,9 +56,10 @@ public final class GlobalClient extends Zeze.Net.Service {
 						login.isTimeout(), login.getResultCode());
 				if (login.isTimeout() || login.getResultCode() != 0) {
 					so.close();
-				}
-				else {
-					agent.getLoginTimes().incrementAndGet();
+				} else {
+					agent.setActiveTime(System.currentTimeMillis());
+					agent.getLoginTimes().getAndIncrement();
+					agent.initialize(login.Result.MaxNetPing, login.Result.ServerProcessTime, login.Result.ServerReleaseTimeout);
 					super.OnHandshakeDone(so);
 				}
 				return 0;
@@ -56,18 +71,7 @@ public final class GlobalClient extends Zeze.Net.Service {
 	public <P extends Protocol<?>> void DispatchProtocol(P p, ProtocolFactoryHandle<P> factoryHandle) {
 		// Reduce 很重要。必须得到执行，不能使用默认线程池(Task.Run),防止饥饿。
 		if (null != factoryHandle.Handle) {
-			getZeze().__GetInternalThreadPoolUnsafe().execute(
-					() -> Zeze.Util.Task.Call(() -> factoryHandle.Handle.handle(p), p));
+			Task.getCriticalThreadPool().execute(() -> Zeze.Util.Task.Call(() -> factoryHandle.Handle.handle(p), p));
 		}
-	}
-
-	@Override
-	public void OnSocketClose(AsyncSocket so, Throwable e) throws Throwable {
-		super.OnSocketClose(so, e);
-		var agent = (GlobalAgent.Agent)so.getUserState();
-		if (null == e) {
-			e = new RuntimeException("Peer Normal Close.");
-		}
-		agent.OnSocketClose(this, e);
 	}
 }

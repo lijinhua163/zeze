@@ -35,7 +35,6 @@ public final class Config {
 	private int CheckpointPeriod = 60000;
 	private Zeze.Transaction.CheckpointMode CheckpointMode = Zeze.Transaction.CheckpointMode.Table;
 	private Level ProcessReturnErrorLogLevel = Level.INFO;
-	private int InternalThreadPoolWorkerCount;
 	private int ServerId;
 	private String GlobalCacheManagerHostNameOrAddress = "";
 	// 分成多行配置，支持多HostNameOrAddress或者多raft.xml。
@@ -103,14 +102,6 @@ public final class Config {
 
 	public void setProcessReturnErrorLogLevel(Level value) {
 		ProcessReturnErrorLogLevel = value;
-	}
-
-	public int getInternalThreadPoolWorkerCount() {
-		return InternalThreadPoolWorkerCount;
-	}
-
-	public void setInternalThreadPoolWorkerCount(int value) {
-		InternalThreadPoolWorkerCount = value;
 	}
 
 	public int getServerId() {
@@ -323,9 +314,6 @@ public final class Config {
 		attr = self.getAttribute("ProcessReturnErrorLogLevel");
 		if (!attr.isEmpty())
 			setProcessReturnErrorLogLevel(Level.toLevel(attr));
-
-		attr = self.getAttribute("InternalThreadPoolWorkerCount");
-		setInternalThreadPoolWorkerCount(attr.length() > 0 ? Integer.parseInt(attr) : 10);
 
 		attr = self.getAttribute("WorkerThreads");
 		setWorkerThreads(attr.length() > 0 ? Integer.parseInt(attr) : -1);
@@ -563,18 +551,26 @@ public final class Config {
 		private int CacheConcurrencyLevel;
 		private int CacheInitialCapacity;
 		private int CacheNewAccessHotThreshold;
+		private float CacheFactor = 5.0f;
 
 		public String getName() {
 			return Name;
 		}
 
+		public int getRealCacheCapacity() {
+			return (int)(CacheCapacity * CacheFactor);
+		}
+
 		public int getCacheCapacity() {
 			return CacheCapacity;
 		}
-
 		public void setCacheCapacity(int value) {
 			CacheCapacity = value;
 		}
+		public float getCacheFactor() {
+			return CacheFactor;
+		}
+		public void setCacheFactor(float factor) { CacheFactor = factor; }
 
 		public int getCacheConcurrencyLevel() {
 			return CacheConcurrencyLevel;
@@ -676,6 +672,9 @@ public final class Config {
 			attr = self.getAttribute("CacheCleanPeriod");
 			if (!attr.isEmpty())
 				setCacheCleanPeriod(Integer.parseInt(attr));
+			attr = self.getAttribute("CacheFactor");
+			if (!attr.isEmpty())
+				setCacheFactor(Float.parseFloat(attr));
 
 			DatabaseName = self.getAttribute("DatabaseName");
 			DatabaseOldName = self.getAttribute("DatabaseOldName");

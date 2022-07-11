@@ -35,9 +35,11 @@ public class DepartmentTree<TManager extends Bean, TMember extends Bean, TDepart
 		}
 
 		@SuppressWarnings("unchecked")
-		public <TManager extends Bean, TMember extends Bean, TDepartmentMember extends Bean> DepartmentTree<TManager, TMember, TDepartmentMember>
+		public <TManager extends Bean, TMember extends Bean, TDepartmentMember extends Bean>
+			DepartmentTree<TManager, TMember, TDepartmentMember>
 			open(String name, Class<TManager> managerClass, Class<TMember> memberClass, Class<TDepartmentMember> departmentMemberClass) {
-			return (DepartmentTree<TManager, TMember, TDepartmentMember>)Trees.computeIfAbsent(name, k -> new DepartmentTree<>(this, k, managerClass, memberClass, departmentMemberClass));
+			return (DepartmentTree<TManager, TMember, TDepartmentMember>)Trees.computeIfAbsent(name,
+					k -> new DepartmentTree<>(this, k, managerClass, memberClass, departmentMemberClass));
 		}
 
 	}
@@ -79,11 +81,11 @@ public class DepartmentTree<TManager extends Bean, TMember extends Bean, TDepart
 	public LinkedMap<TDepartmentMember> getDepartmentMembers(long departmentId) {
 		if (departmentId == 0)
 			throw new RuntimeException("root members use getMembers.");
-		return module.LinkedMaps.<TDepartmentMember>open("" + departmentId + "#" + name, departmentMemberClass);
+		return module.LinkedMaps.open("" + departmentId + "#" + name, departmentMemberClass);
 	}
 
 	public LinkedMap<TMember> getGroupMembers() {
-		return module.LinkedMaps.<TMember>open("0#" + name, memberClass);
+		return module.LinkedMaps.open("0#" + name, memberClass);
 	}
 
 	public BDepartmentRoot selectRoot() {
@@ -94,10 +96,8 @@ public class DepartmentTree<TManager extends Bean, TMember extends Bean, TDepart
 		return module._tDepartmentTree.selectDirty(new BDepartmentKey(name, departmentId));
 	}
 
-	public BDepartmentRoot create(String root) {
-		var dRoot = module._tDepartment.getOrAdd(name);
-		dRoot.setRoot(root);
-		return dRoot;
+	public BDepartmentRoot create() {
+		return module._tDepartment.getOrAdd(name);
 	}
 
 	public long changeRoot(String oldRoot, String newRoot) {
@@ -131,22 +131,22 @@ public class DepartmentTree<TManager extends Bean, TMember extends Bean, TDepart
 		}).getBean();
 	}
 
-	public long createDepartment(long departmentParent, String name, OutLong outDepartmentId) {
+	public long createDepartment(long departmentParent, String dName, OutLong outDepartmentId) {
 		var dRoot = module._tDepartment.getOrAdd(name);
 		var dId = dRoot.getNextDepartmentId() + 1;
 
 		if (departmentParent == 0) {
-			if (null != dRoot.getChilds().putIfAbsent(name, dId))
+			if (null != dRoot.getChilds().putIfAbsent(dName, dId))
 				return module.ErrorCode(Module.ErrorDepartmentDuplicate);
 		} else {
 			var parent = getDepartmentTreeNode(departmentParent);
-			if (null != parent.getChilds().putIfAbsent(name, dId))
+			if (null != parent.getChilds().putIfAbsent(dName, dId))
 				return module.ErrorCode(Module.ErrorDepartmentDuplicate);
 		}
 		var child = new BDepartmentTreeNode();
-		child.setName(name);
+		child.setName(dName);
 		child.setParentDepartment(departmentParent);
-		module._tDepartmentTree.insert(new BDepartmentKey(getName(), dId), child);
+		module._tDepartmentTree.insert(new BDepartmentKey(name, dId), child);
 		dRoot.setNextDepartmentId(dId);
 		if (null != outDepartmentId)
 			outDepartmentId.Value = dId;

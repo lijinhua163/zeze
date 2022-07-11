@@ -9,13 +9,12 @@ import Zeze.Arch.LoadConfig;
 import Zeze.Config;
 import Zeze.Net.AsyncSocket;
 import Zeze.Net.Service;
-import Zeze.Transaction.Transaction;
 import Zeze.Transaction.TransactionLevel;
 import Zeze.Util.PersistentAtomicLong;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.tikv.shade.com.fasterxml.jackson.databind.ObjectMapper;
 
 public class App extends Zeze.AppBase {
-    public static App Instance = new App();
+    public static final App Instance = new App();
     public static App getInstance() {
         return Instance;
     }
@@ -33,8 +32,8 @@ public class App extends Zeze.AppBase {
         return new LoadConfig();
     }
 
-    public void Start() throws Throwable {
-        var config = Config.Load("linkd.xml");
+    public void Start(String conf) throws Throwable {
+        var config = Config.Load(conf);
         CreateZeze(config);
         CreateService();
         LinkdProvider = new LinkdProvider();
@@ -54,7 +53,8 @@ public class App extends Zeze.AppBase {
     public void Stop() throws Throwable {
         StopService(); // 关闭网络
         StopModules(); // 关闭模块，卸载配置什么的。
-        Zeze.Stop(); // 关闭数据库
+        if (Zeze != null)
+            Zeze.Stop(); // 关闭数据库
         DestroyModules();
         DestroyServices();
         DestroyZeze();
@@ -67,6 +67,8 @@ public class App extends Zeze.AppBase {
     public Zege.LinkdService LinkdService;
     public Zege.ProviderService ProviderService;
 
+    public Zege.Friend.ModuleFriend Zege_Friend;
+    public Zege.Message.ModuleMessage Zege_Message;
     public Zege.Linkd.ModuleLinkd Zege_Linkd;
 
     @Override
@@ -91,6 +93,16 @@ public class App extends Zeze.AppBase {
         ProviderService = new Zege.ProviderService(Zeze);
     }
     public synchronized void CreateModules() {
+        Zege_Friend = ReplaceModuleInstance(new Zege.Friend.ModuleFriend(this));
+        Zege_Friend.Initialize(this);
+        if (Modules.put(Zege_Friend.getFullName(), Zege_Friend) != null)
+            throw new RuntimeException("duplicate module name: Zege_Friend");
+
+        Zege_Message = ReplaceModuleInstance(new Zege.Message.ModuleMessage(this));
+        Zege_Message.Initialize(this);
+        if (Modules.put(Zege_Message.getFullName(), Zege_Message) != null)
+            throw new RuntimeException("duplicate module name: Zege_Message");
+
         Zege_Linkd = ReplaceModuleInstance(new Zege.Linkd.ModuleLinkd(this));
         Zege_Linkd.Initialize(this);
         if (Modules.put(Zege_Linkd.getFullName(), Zege_Linkd) != null)
@@ -101,6 +113,8 @@ public class App extends Zeze.AppBase {
 
     public synchronized void DestroyModules() {
         Zege_Linkd = null;
+        Zege_Message = null;
+        Zege_Friend = null;
         Modules.clear();
     }
 
@@ -114,12 +128,18 @@ public class App extends Zeze.AppBase {
     }
 
     public synchronized void StartModules() throws Throwable {
+        Zege_Friend.Start(this);
+        Zege_Message.Start(this);
         Zege_Linkd.Start(this);
     }
 
     public synchronized void StopModules() throws Throwable {
         if (Zege_Linkd != null)
             Zege_Linkd.Stop(this);
+        if (Zege_Message != null)
+            Zege_Message.Stop(this);
+        if (Zege_Friend != null)
+            Zege_Friend.Stop(this);
     }
 
     public synchronized void StartService() throws Throwable {

@@ -40,7 +40,7 @@ namespace Zeze.Arch
 
         public void Kick(string linkName, long linkSid, int code, string desc)
         {
-            if (Links.TryGetValue(linkName, out var link))
+            if (linkSid != 0 && Links.TryGetValue(linkName, out var link))
                 ProviderImplement.SendKick(link.TryGetReadySocket(), linkSid, code, desc);
         }
 
@@ -132,15 +132,6 @@ namespace Zeze.Arch
             var sub = new Subscribe();
             sub.Argument.Modules.AddRange(ProviderApp.DynamicModules);
             sub.Send(sender, (protocol) => { ProviderDynamicSubscribeCompleted.SetResult(true); return Task.FromResult(0L); });
-        }
-
-        public override void DispatchProtocol(Protocol p, ProtocolFactoryHandle factoryHandle)
-        {
-            // 防止Client不进入加密，直接发送用户协议。
-            if (false == IsHandshakeProtocol(p.TypeId))
-                p.Sender.VerifySecurity();
-
-            base.DispatchProtocol(p, factoryHandle);
         }
 
         /*

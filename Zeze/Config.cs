@@ -71,10 +71,11 @@ namespace Zeze
             return false;
         }
 
-        public void AddCustomize(ICustomize c)
+        public Config AddCustomize(ICustomize c)
         {
             if (!Customize.TryAdd(c.Name, c))
                 throw new Exception($"Duplicate Customize Config '{c.Name}'");
+            return this;
         }
 
         public TableConf GetTableConf(string name)
@@ -217,6 +218,9 @@ namespace Zeze
                 Application.logger.Warn("CheckpointMode.Period Cannot Work With Global. Change To CheckpointMode.Table Now.");
                 CheckpointMode = Transaction.CheckpointMode.Table;
             }
+            if (CheckpointMode == Transaction.CheckpointMode.Immediately)
+                throw new NotImplementedException("Disable!");
+
             attr = self.GetAttribute("DonotCheckSchemasWhenTableIsNew");
             if (attr.Length > 0)
                 DonotCheckSchemasWhenTableIsNew = bool.Parse(attr);

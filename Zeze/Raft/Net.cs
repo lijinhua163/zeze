@@ -162,10 +162,6 @@ namespace Zeze.Raft
 
         public override void DispatchProtocol(Protocol p, ProtocolFactoryHandle factoryHandle)
         {
-            // 防止Client不进入加密，直接发送用户协议。
-            if (false == IsHandshakeProtocol(p.TypeId))
-                p.Sender.VerifySecurity();
-
             if (IsImportantProtocol(p.TypeId))
             {
                 _ = Util.Mission.CallAsync(factoryHandle.Handle, p, null);
@@ -185,7 +181,7 @@ namespace Zeze.Raft
                 //【防止重复的请求】
                 // see Log.cs::LogSequence.TryApply
                 TaskOneByOne.Execute(iraftrpc.Unique, async (p) => await ProcessReqeust(p, factoryHandle),
-                    p, (p, code) => p.SendResultCode(code), () => p.SendResultCode(Procedure.RaftRetry));
+                    p, (p, code) => p.TrySendResultCode(code), () => p.TrySendResultCode(Procedure.RaftRetry));
                 return;
             }
 
@@ -315,6 +311,10 @@ namespace Zeze.Raft
         /// </summary>
         public abstract UniqueRequestId Unique { get; set; }
         public abstract long SendTime { get; set; } // 不系列化，Agent本地只用。
+        public abstract int RaftTimeout { get; }
+        public abstract bool TrySetFutureException(Exception e);
+        public abstract Func<Protocol, Task<long>> RaftHandle { get; set; }
+        public abstract void SetIsTimeout(bool value);
     }
 
     public abstract class RaftRpc<TArgument, TResult> : Rpc<TArgument, TResult>, IRaftRpc
@@ -326,6 +326,24 @@ namespace Zeze.Raft
         public long SendTime { get; set; }
         public bool Urgent { get; set; } = false;
 
+        // internal TaskCompletionSource<TResult>> RaftFuture; // 直接使用 Zeze.Net.Rpc.Future
+        public bool TrySetFutureException(Exception e)
+        {
+            if (base.Future != null)
+            {
+                base.Future.TrySetException(e);
+                return true; // 忽略结果，总是true。这里需要的语义是Future是否存在。
+            }
+            return false;
+        }
+
+        public int RaftTimeout => base.Timeout;
+        public Func<Protocol, Task<long>> RaftHandle { get; set; }
+        public void SetIsTimeout(bool value)
+        {
+            base.IsTimeout = value;
+        }
+
         public override bool Send(AsyncSocket socket)
         {
             var bridge = new RaftRpcBridge<TArgument, TResult>(this)
@@ -333,7 +351,8 @@ namespace Zeze.Raft
                 ResponseHandle = this.ResponseHandle,
                 Argument = this.Argument,
                 CreateTime = this.CreateTime,
-                Unique = this.Unique
+                Unique = this.Unique,
+                ResultCode = this.ResultCode
             };
 
             return bridge.Send(socket, bridge.ResponseHandle, this.Timeout);
@@ -416,6 +435,7 @@ namespace Zeze.Raft
         private readonly ConcurrentDictionary<long, Protocol> UrgentPending = new();
 
         public Action<Agent> OnSetLeader { get; set; }
+        public int PendingLimit { get; set; } = 5000; // -1 no limit
 
         /// <summary>
         /// 发送Rpc请求。
@@ -433,6 +453,8 @@ namespace Zeze.Raft
         {
             if (null == handle)
                 throw new ArgumentException("null == handle");
+            if (PendingLimit > 0 && Pending.Count > PendingLimit) // UrgentPending不限制。
+                throw new Exception("too many pending");
 
             // 由于interface不能把setter弄成保护的，实际上外面可以修改。
             // 简单检查一下吧。
@@ -440,11 +462,14 @@ namespace Zeze.Raft
                 throw new Exception("RaftRpc.UniqueRequestId != 0. Need A Fresh RaftRpc");
 
             rpc.Unique.RequestId = UniqueRequestIdGenerator.Next();
-            rpc.Unique.ClientId = UniqueRequestIdGenerator.Name;
+            // 外面在发送前可以设置clientId
+            if (rpc.Unique.ClientId.Length == 0)
+                rpc.Unique.ClientId = UniqueRequestIdGenerator.Name;
             rpc.CreateTime = Util.Time.NowUnixMillis;
             rpc.SendTime = rpc.CreateTime;
-            rpc.Timeout = RaftConfig.AppendEntriesTimeout;
-
+            if (rpc.Timeout == 0)
+                rpc.Timeout = RaftConfig.AppendEntriesTimeout;
+            rpc.RaftHandle = handle;
             rpc.Urgent = urgent;
             if (urgent)
             {
@@ -501,7 +526,7 @@ namespace Zeze.Raft
 
         private long SendForWaitHandle<TArgument, TResult>(
             Protocol p,
-            TaskCompletionSource<RaftRpc<TArgument, TResult>> future,
+            TaskCompletionSource<TResult> future,
             RaftRpc<TArgument, TResult> rpc)
             where TArgument : Bean, new()
             where TResult : Bean, new()
@@ -526,7 +551,7 @@ namespace Zeze.Raft
                     rpc.IsTimeout = false;
                 }
                 logger.Debug($"Agent Rpc={rpc.GetType().Name} RequestId={rpc.Unique.RequestId} ResultCode={rpc.ResultCode} Sender={rpc.Sender}");
-                future.SetResult(rpc);
+                future.SetResult(rpc.Result);
             }
             return Procedure.Success;
         }
@@ -542,14 +567,20 @@ namespace Zeze.Raft
             if (rpc.Unique.RequestId != 0)
                 throw new Exception("RaftRpc.UniqueRequestId != 0. Need A Fresh RaftRpc");
 
+            if (PendingLimit > 0 && Pending.Count > PendingLimit) // UrgentPending不限制。
+                throw new Exception("too many pending");
+
             rpc.Unique.RequestId = UniqueRequestIdGenerator.Next();
-            rpc.Unique.ClientId = UniqueRequestIdGenerator.Name;
+            // 外面在发送前可以设置clientId
+            if (rpc.Unique.ClientId.Length == 0)
+                rpc.Unique.ClientId = UniqueRequestIdGenerator.Name;
             rpc.CreateTime = Util.Time.NowUnixMillis;
             rpc.SendTime = rpc.CreateTime;
-            rpc.Timeout = RaftConfig.AppendEntriesTimeout;
+            if (rpc.Timeout == 0)
+                rpc.Timeout = RaftConfig.AppendEntriesTimeout;
 
-            var future = new TaskCompletionSource<RaftRpc<TArgument, TResult>>(TaskCreationOptions.RunContinuationsAsynchronously);
-
+            var future = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            rpc.Future = future;
             rpc.Urgent = urgent;
             if (urgent)
             {
@@ -707,34 +738,95 @@ namespace Zeze.Raft
             // ReSendPendingRpc
             var now = Util.Time.NowUnixMillis;
             var leaderSocket = _Leader?.TryGetReadySocket();
-            if (null != leaderSocket)
+            var removed = new List<Protocol>(UrgentPending.Count + Pending.Count);
+            foreach (var e in UrgentPending)
             {
-                foreach (var rpc in UrgentPending.Values)
+                var rpc = e.Value;
+                var iraft = rpc as IRaftRpc;
+                if (iraft.RaftTimeout > 0 && now - iraft.CreateTime > iraft.RaftTimeout)
                 {
-                    var iraft = rpc as IRaftRpc;
-                    if (immediately || now - iraft.SendTime > RaftConfig.AppendEntriesTimeout + 1000)
-                    {
-                        logger.Debug($"{leaderSocket} {rpc}");
-
-                        iraft.SendTime = now;
-                        if (false == rpc.Send(leaderSocket))
-                            logger.Warn("SendRequest failed {0}", rpc);
-                    }
+                    if (UrgentPending.Remove(e.Key, out var r))
+                        removed.Add(r);
+                    continue;
                 }
-
-                foreach (var rpc in Pending.Values)
+                if (immediately || now - iraft.SendTime > RaftConfig.AppendEntriesTimeout + 1000)
                 {
-                    var iraft = rpc as IRaftRpc;
-                    if (immediately || now - iraft.SendTime > RaftConfig.AppendEntriesTimeout + 1000)
-                    {
-                        logger.Debug($"{leaderSocket} {rpc}");
+                    logger.Debug($"{leaderSocket} {rpc}");
 
-                        iraft.SendTime = now;
-                        if (false == rpc.Send(leaderSocket))
-                            logger.Warn("SendRequest failed {0}", rpc);
+                    iraft.SendTime = now;
+                    if (false == rpc.Send(leaderSocket))
+                    {
+                        logger.Info("SendRequest failed {0}", rpc);
+                        break;
                     }
                 }
             }
+
+            foreach (var e in Pending)
+            {
+                var rpc = e.Value;
+                var iraft = rpc as IRaftRpc;
+                if (iraft.RaftTimeout > 0 && now - iraft.CreateTime > iraft.RaftTimeout)
+                {
+                    if (Pending.Remove(e.Key, out var r))
+                        removed.Add(r);
+                    continue;
+                }
+                if (immediately || now - iraft.SendTime > RaftConfig.AppendEntriesTimeout + 1000)
+                {
+                    logger.Debug($"{leaderSocket} {rpc}");
+
+                    iraft.SendTime = now;
+                    if (false == rpc.Send(leaderSocket))
+                    {
+                        logger.Info("SendRequest failed {0}", rpc);
+                        break;
+                    }
+                }
+            }
+            Trigger(removed, "Timeout");
+        }
+
+
+        private void Trigger(List<Protocol> removed, string reason)
+        {
+            if (removed.Count == 0)
+                return;
+
+            Task.Run(() =>
+            {
+                foreach (var p in removed)
+                {
+                    var r = p as IRaftRpc;
+                    r.SetIsTimeout(true);
+                    if (r.TrySetFutureException(new Exception(reason)))
+                        continue;
+                    try
+                    {
+                        r.RaftHandle?.Invoke(p);
+                    }
+                    catch (Exception e)
+                    {
+                        logger.Error(e);
+                    }
+                }
+            });
+        }
+
+        public void CancelPending()
+        {
+            // 不包括UrgentPending
+            if (Pending.Count == 0)
+                return;
+
+            var removed = new List<Protocol>();
+            // Pending存在并发访问，这样写更可靠。
+            foreach (var e in Pending)
+            {
+                if (Pending.Remove(e.Key, out var r))
+                    removed.Add(r);
+            }
+            Trigger(removed, "Cancel");
         }
 
         internal bool SetLeader(LeaderIs r, ConnectorEx newLeader)
@@ -779,10 +871,6 @@ namespace Zeze.Raft
 
             public override void DispatchProtocol(Protocol p, ProtocolFactoryHandle pfh)
             {
-                // 防止Client不进入加密，直接发送用户协议。
-                if (false == IsHandshakeProtocol(p.TypeId))
-                    p.Sender.VerifySecurity();
-
                 // await 按收到顺序处理，不并发。这样也避免线程切换。
                 _ = Util.Mission.CallAsync(pfh.Handle, p, null);
             }

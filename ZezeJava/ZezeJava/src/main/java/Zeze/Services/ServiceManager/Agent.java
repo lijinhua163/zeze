@@ -27,9 +27,9 @@ public final class Agent implements Closeable {
 	/**
 	 * 订阅服务状态发生变化时回调。 如果需要处理这个事件，请在订阅前设置回调。
 	 */
-	private Action1<SubscribeState> OnChanged;
-	private Action2<SubscribeState, ServiceInfo> OnUpdate;
-	private Action2<SubscribeState, ServiceInfo> OnRemove;
+	private Action1<SubscribeState> OnChanged; // Simple Or ReadyCommit
+	private Action2<SubscribeState, ServiceInfo> OnUpdate; // Simple
+	private Action2<SubscribeState, ServiceInfo> OnRemove; // Simple
 	private Action1<SubscribeState> OnPrepare; // ReadyCommit 的第一步回调。
 	private Action1<ServerLoad> OnSetServerLoad;
 
@@ -49,6 +49,16 @@ public final class Agent implements Closeable {
 	public ConcurrentHashMap<String, SubscribeState> getSubscribeStates() {
 		return SubscribeStates;
 	}
+
+	/*
+	public Object getLocalState(String serviceName, String identity) {
+		return SubscribeStates.get(serviceName).LocalStates.get(identity);
+	}
+
+	public Object getLocalState(ServiceInfo serviceInfo) {
+		return getLocalState(serviceInfo.getServiceName(), serviceInfo.getServiceIdentity());
+	}
+	*/
 
 	public final ConcurrentHashMap<String, ServerLoad> Loads = new ConcurrentHashMap<>();
 
@@ -123,7 +133,7 @@ public final class Agent implements Closeable {
 		 */
 		private boolean Committed = false;
 		// 服务准备好。
-		private final ConcurrentHashMap<String, Object> ServiceIdentityReadyStates = new ConcurrentHashMap<>();
+		public final ConcurrentHashMap<String, Object> LocalStates = new ConcurrentHashMap<>();
 
 		public SubscribeInfo getSubscribeInfo() {
 			return subscribeInfo;
@@ -175,7 +185,7 @@ public final class Agent implements Closeable {
 			}
 
 			for (var p : pending.getServiceInfoListSortedByIdentity()) {
-				if (!ServiceIdentityReadyStates.containsKey(p.getServiceIdentity())) {
+				if (!LocalStates.containsKey(p.getServiceIdentity())) {
 					return false;
 				}
 			}
@@ -190,31 +200,26 @@ public final class Agent implements Closeable {
 
 		public void SetServiceIdentityReadyState(String identity, Object state) {
 			if (null == state) {
-				ServiceIdentityReadyStates.remove(identity);
+				LocalStates.remove(identity);
 			} else {
-				ServiceIdentityReadyStates.put(identity, state);
+				LocalStates.put(identity, state);
 			}
 
 			synchronized (this) {
-				// 把 state 复制到当前版本的服务列表中。允许列表不变，服务状态改变。
-				if (null != ServiceInfos) {
-					ServiceInfo info = ServiceInfos.get(identity);
-					if (null != info)
-						info.setLocalState(state);
-				}
+				// 尝试发送Ready，如果有pending.
+				TrySendReadyServiceList();
 			}
-			// 尝试发送Ready，如果有pending.
-			TrySendReadyServiceList();
 		}
 
 		private void PrepareAndTriggerOnChanged() {
-			for (var info : getServiceInfos().getServiceInfoListSortedByIdentity()) {
-				var state = ServiceIdentityReadyStates.get(info.getServiceIdentity());
-				if (null != state) // 需要确认里面会不会存null。
-					info.setLocalState(state);
-			}
 			if (Agent.this.OnChanged != null) {
-				Task.run(() -> Agent.this.OnChanged.run(this), "ServiceManager.Agent.OnChanged");
+				Task.getCriticalThreadPool().execute(() -> {
+					try {
+						Agent.this.OnChanged.run(this);
+					} catch (Throwable e) {
+						logger.error("", e);
+					}
+				});
 			}
 		}
 
@@ -227,27 +232,66 @@ public final class Agent implements Closeable {
 			exist.setPassivePort(info.getPassivePort());
 			exist.setExtraInfo(info.getExtraInfo());
 
-			if (Agent.this.OnUpdate != null)
-				Task.run(() -> Agent.this.OnUpdate.run(this, exist), "ServiceManager.Agent.OnUpdate");
-			else if (null != Agent.this.OnChanged)
-				Task.run(() -> Agent.this.OnChanged.run(this), "ServiceManager.Agent.OnUpdate.OnChanged");
+			if (Agent.this.OnUpdate != null) {
+				Task.getCriticalThreadPool().execute(() -> {
+					try {
+						Agent.this.OnUpdate.run(this, exist);
+					} catch (Throwable e) {
+						logger.error("", e);
+					}
+				});
+			} else if (null != Agent.this.OnChanged) {
+				Task.getCriticalThreadPool().execute(() -> {
+					try {
+						Agent.this.OnChanged.run(this);
+					} catch (Throwable e) {
+						logger.error("", e);
+					}
+				});
+			}
 		}
 
 		synchronized void OnRegister(ServiceInfo info) {
 			var info2 = ServiceInfos.Insert(info);
-			if (Agent.this.OnUpdate != null)
-				Task.run(() -> Agent.this.OnUpdate.run(this, info2), "ServiceManager.Agent.OnUpdate");
-			else if (null != Agent.this.OnChanged)
-				Task.run(() -> Agent.this.OnChanged.run(this), "ServiceManager.Agent.OnUpdate.OnChanged");
+			if (Agent.this.OnUpdate != null) {
+				Task.getCriticalThreadPool().execute(() -> {
+					try {
+						Agent.this.OnUpdate.run(this, info2);
+					} catch (Throwable e) {
+						logger.error("", e);
+					}
+				});
+			} else if (null != Agent.this.OnChanged) {
+				Task.getCriticalThreadPool().execute(() -> {
+					try {
+						Agent.this.OnChanged.run(this);
+					} catch (Throwable e) {
+						logger.error("", e);
+					}
+				});
+			}
 		}
 
 		synchronized void OnUnRegister(ServiceInfo info) {
 			var info2 = ServiceInfos.Remove(info);
 			if (null != info2) {
-				if (Agent.this.OnRemove != null)
-					Task.run(() -> Agent.this.OnRemove.run(this, info2), "ServiceManager.Agent.OnRemove");
-				else if (Agent.this.OnChanged != null)
-					Task.run(() -> Agent.this.OnChanged.run(this), "ServiceManager.Agent.OnRemove.OnChanged");
+				if (Agent.this.OnRemove != null) {
+					Task.getCriticalThreadPool().execute(() -> {
+						try {
+							Agent.this.OnRemove.run(this, info2);
+						} catch (Throwable e) {
+							logger.error("", e);
+						}
+					});
+				} else if (Agent.this.OnChanged != null) {
+					Task.getCriticalThreadPool().execute(() -> {
+						try {
+							Agent.this.OnChanged.run(this);
+						} catch (Throwable e) {
+							logger.error("", e);
+						}
+					});
+				}
 			}
 		}
 
@@ -264,7 +308,13 @@ public final class Agent implements Closeable {
 						|| infos.getSerialId() > getServiceInfosPending().getSerialId()) {
 					ServiceInfosPending = infos;
 					if (null != OnPrepare)
-						Task.run(() -> OnPrepare.run(this), "ServiceManager.Agent.OnPrepare");
+						Task.getCriticalThreadPool().execute(() -> {
+							try {
+								OnPrepare.run(this);
+							} catch (Throwable e) {
+								logger.error("", e);
+							}
+						});
 					TrySendReadyServiceList();
 				}
 				break;
@@ -287,7 +337,7 @@ public final class Agent implements Closeable {
 			if (ServiceInfosPending == null)
 				return; // 并发过来的Commit，只需要处理一个。
 			if (r.Argument.SerialId != ServiceInfosPending.getSerialId()) {
-				logger.warn("OnCommit " + getServiceName() + " " + r.Argument.SerialId + " != " + ServiceInfosPending.getSerialId());
+				logger.warn("OnCommit {} {} != {}", getServiceName(), r.Argument.SerialId, ServiceInfosPending.getSerialId());
 			}
 			setServiceInfos(ServiceInfosPending);
 			ServiceInfosPending = null;
@@ -352,10 +402,11 @@ public final class Agent implements Closeable {
 		return reg;
 	}
 
-	private void Verify(String identity)
-	{
-		if (false == identity.startsWith("@"))
+	private void Verify(String identity) {
+		if (!identity.startsWith("@")) {
+			//noinspection ResultOfMethodCallIgnored
 			Integer.parseInt(identity);
+		}
 	}
 
 	private ServiceInfo RegisterService(ServiceInfo info) {
@@ -374,7 +425,7 @@ public final class Agent implements Closeable {
 				var r = new Register();
 				r.Argument = info;
 				r.SendAndWaitCheckResultCode(Client.getSocket());
-				logger.debug("RegisterService " + info);
+				logger.debug("RegisterService {}", info);
 			} catch (Throwable e) {
 				getRegisters().remove(info, info); // rollback
 				throw e;
@@ -433,7 +484,7 @@ public final class Agent implements Closeable {
 			var r = new Subscribe();
 			r.Argument = info;
 			r.SendAndWaitCheckResultCode(Client.getSocket());
-			logger.debug("SubscribeService " + info);
+			logger.debug("SubscribeService {}", info);
 		}
 		return subState;
 	}
@@ -520,7 +571,7 @@ public final class Agent implements Closeable {
 
 	private long ProcessKeepAlive(KeepAlive r) {
 		if (OnKeepAlive != null) {
-			Task.run(OnKeepAlive::run, "OnKeepAlive");
+			Task.getCriticalThreadPool().execute(OnKeepAlive);
 		}
 		r.SendResultCode(KeepAlive.Success);
 		return Procedure.Success;
@@ -529,7 +580,13 @@ public final class Agent implements Closeable {
 	private long ProcessSetServerLoad(SetServerLoad setServerLoad) {
 		Loads.put(setServerLoad.Argument.getName(), setServerLoad.Argument);
 		if (null != OnSetServerLoad)
-			Task.run(() -> OnSetServerLoad.run(setServerLoad.Argument), "OnSetServerLoad");
+			Task.getCriticalThreadPool().execute(() -> {
+				try {
+					OnSetServerLoad.run(setServerLoad.Argument);
+				} catch (Throwable e) {
+					logger.error("", e);
+				}
+			});
 		return Procedure.Success;
 	}
 

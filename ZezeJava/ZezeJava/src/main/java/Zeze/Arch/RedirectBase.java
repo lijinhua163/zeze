@@ -13,7 +13,6 @@ import Zeze.Transaction.TransactionLevel;
 import Zeze.Util.Action0;
 import Zeze.Util.Func0;
 import Zeze.Util.LongHashMap;
-import Zeze.Util.OutLong;
 import Zeze.Util.Task;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -56,7 +55,7 @@ public class RedirectBase {
 		 */
 	}
 
-	public AsyncSocket ChoiceHash(IModule module, int hash) {
+	public AsyncSocket ChoiceHash(IModule module, int hash, int dataConcurrentLevel) {
 		var subscribes = ProviderApp.Zeze.getServiceManagerAgent().getSubscribeStates();
 		var serviceName = ProviderDistribute.MakeServiceName(ProviderApp.ServerServiceNamePrefix, module.getId());
 
@@ -64,15 +63,36 @@ public class RedirectBase {
 		if (servers == null)
 			return null;
 
-		var serviceInfo = ProviderApp.Distribute.ChoiceHash(servers, hash);
+		var serviceInfo = ProviderApp.Distribute.ChoiceHash(servers, hash, dataConcurrentLevel);
 		if (serviceInfo == null || serviceInfo.getServiceIdentity().equals(String.valueOf(ProviderApp.Zeze.getConfig().getServerId())))
 			return null;
 
-		var providerModuleState = (ProviderModuleState)serviceInfo.getLocalState();
+		var providerModuleState = (ProviderModuleState)servers.LocalStates.get(serviceInfo.getServiceIdentity());
 		if (providerModuleState == null)
 			return null;
 
 		return ProviderApp.ProviderDirectService.GetSocket(providerModuleState.SessionId);
+	}
+
+	private void AddMiss(ModuleRedirectAllResult miss, int i, @SuppressWarnings("SameParameterValue") long rc) {
+		var hashResult = new BModuleRedirectAllHash();
+		hashResult.setReturnCode(rc);
+		miss.Argument.getHashs().put(i, hashResult);
+	}
+
+	private void AddTransmits(LongHashMap<ModuleRedirectAllRequest> transmits, long provider, int index, ModuleRedirectAllRequest req) {
+		var exist = transmits.get(provider);
+		if (exist == null) {
+			exist = new ModuleRedirectAllRequest();
+			exist.Argument.setModuleId(req.Argument.getModuleId());
+			exist.Argument.setHashCodeConcurrentLevel(req.Argument.getHashCodeConcurrentLevel());
+			exist.Argument.setMethodFullName(req.Argument.getMethodFullName());
+			exist.Argument.setSourceProvider(req.Argument.getSourceProvider());
+			exist.Argument.setSessionId(req.Argument.getSessionId());
+			exist.Argument.setParams(req.Argument.getParams());
+			transmits.put(provider, exist);
+		}
+		exist.Argument.getHashCodes().add(index);
 	}
 
 	public <T extends RedirectResult> RedirectAllFuture<T> RedirectAll(IModule module, ModuleRedirectAllRequest req,
@@ -83,29 +103,28 @@ public class RedirectBase {
 			return future;
 		}
 
-		LongHashMap<ModuleRedirectAllRequest> transmits = new LongHashMap<>(); // <sessionId, request>
+		var transmits = new LongHashMap<ModuleRedirectAllRequest>(); // <sessionId, request>
 		var miss = new ModuleRedirectAllResult();
-		var provider = new OutLong();
+		var serviceName = ProviderDistribute.MakeServiceName(req.Argument.getServiceNamePrefix(), req.Argument.getModuleId());
+		var consistent = ProviderApp.Distribute.getConsistentHash(serviceName);
+		var providers = ProviderApp.Zeze.getServiceManagerAgent().getSubscribeStates().get(serviceName);
+		var localServiceIdentity = String.valueOf(ProviderApp.Zeze.getConfig().getServerId());
 		for (int i = 0; i < req.Argument.getHashCodeConcurrentLevel(); ++i) {
-			if (ProviderApp.Distribute.ChoiceProvider(req.Argument.getServiceNamePrefix(),
-					req.Argument.getModuleId(), i, provider)) {
-				var exist = transmits.get(provider.Value);
-				if (exist == null) {
-					exist = new ModuleRedirectAllRequest();
-					exist.Argument.setModuleId(req.Argument.getModuleId());
-					exist.Argument.setHashCodeConcurrentLevel(req.Argument.getHashCodeConcurrentLevel());
-					exist.Argument.setMethodFullName(req.Argument.getMethodFullName());
-					exist.Argument.setSourceProvider(req.Argument.getSourceProvider());
-					exist.Argument.setSessionId(req.Argument.getSessionId());
-					exist.Argument.setParams(req.Argument.getParams());
-					transmits.put(provider.Value, exist);
-				}
-				exist.Argument.getHashCodes().add(i);
-			} else {
-				var hashResult = new BModuleRedirectAllHash();
-				hashResult.setReturnCode(Zeze.Transaction.Procedure.ProviderNotExist);
-				miss.Argument.getHashs().put(i, hashResult);
+			var target = ProviderApp.Distribute.ChoiceDataIndex(consistent, i, req.Argument.getHashCodeConcurrentLevel());
+			if (null == target) {
+				AddMiss(miss, i, Procedure.ProviderNotExist);
+				continue;
 			}
+			if (target.getServiceIdentity().equals(localServiceIdentity)) {
+				AddTransmits(transmits, 0, i, req);
+				continue; // loop-back
+			}
+			var localState = providers.LocalStates.get(target.getServiceIdentity());
+			if (localState == null) {
+				AddMiss(miss, i, Procedure.ProviderNotExist);
+				continue; // not ready
+			}
+			AddTransmits(transmits, ((ProviderModuleState)localState).SessionId, i, req);
 		}
 
 		// 转发给provider
@@ -124,7 +143,7 @@ public class RedirectBase {
 				} else {
 					for (var hashIndex : request.Argument.getHashCodes()) {
 						BModuleRedirectAllHash hashResult = new BModuleRedirectAllHash();
-						hashResult.setReturnCode(Zeze.Transaction.Procedure.ProviderNotExist);
+						hashResult.setReturnCode(Procedure.ProviderNotExist);
 						miss.Argument.getHashs().put(hashIndex, hashResult);
 					}
 				}

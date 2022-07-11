@@ -1,7 +1,6 @@
 package Zeze.Transaction;
 
 import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.function.Supplier;
@@ -11,89 +10,86 @@ import org.apache.logging.log4j.Logger;
 
 public final class Transaction {
 	private static final Logger logger = LogManager.getLogger(Transaction.class);
-
-	private final static ThreadLocal<Transaction> threadLocal = new ThreadLocal<>();
-
-	public static Transaction getCurrent() {
-		var t = threadLocal.get();
-		if (null == t)
-			return null;
-		return t.Created ? t : null;
-	}
-
-	// 嵌套存储过程栈。
-	private final ArrayList<Procedure> ProcedureStack = new ArrayList<> ();
-	public ArrayList<Procedure> getProcedureStack() {
-		return ProcedureStack;
-	}
-
-
-	private final List<Savepoint.Action> Actions = new ArrayList<>();
-
-	public Procedure getTopProcedure() {
-		return getProcedureStack().isEmpty() ? null : getProcedureStack().get(getProcedureStack().size() - 1);
-	}
-
-	private boolean Created = true;
-
-	private void ReuseTransaction()
-	{
-		this.Created = false;
-
-		this.AccessedRecords.clear();
-		//this.holdLocks.Clear(); // 执行完肯定清理了。
-		this.State = TransactionState.Running;
-		this.ProcedureStack.clear();
-		this.Savepoints.clear();
-		this.Actions.clear();
-	}
-
-	private Locks Locks;
+	private static final ThreadLocal<Transaction> threadLocal = new ThreadLocal<>();
 
 	public static Transaction Create(Locks locks) {
 		var t = threadLocal.get();
-		if (null == t) {
-			t = new Transaction();
-			t.Locks = locks;
-			threadLocal.set(t);
-			return t;
-		}
+		if (t == null)
+			threadLocal.set(t = new Transaction());
 		t.Locks = locks;
 		t.Created = true;
 		return t;
 	}
 
 	public static void Destroy() {
-		threadLocal.get().ReuseTransaction();
+		var t = threadLocal.get();
+		if (t != null)
+			t.ReuseTransaction();
+	}
+
+	public static Transaction getCurrent() {
+		var t = threadLocal.get();
+		return t != null && t.Created ? t : null;
+	}
+
+	private final ArrayList<Lockey> holdLocks = new ArrayList<>(); // 读写锁的话需要一个包装类，用来记录当前维持的是哪个锁。
+	private final ArrayList<Procedure> ProcedureStack = new ArrayList<>(); // 嵌套存储过程栈。
+	private final ArrayList<Savepoint> Savepoints = new ArrayList<>();
+	private final ArrayList<Savepoint.Action> Actions = new ArrayList<>();
+	private final TreeMap<TableKey, RecordAccessed> AccessedRecords = new TreeMap<>();
+	private Locks Locks;
+	private TransactionState State = TransactionState.Running;
+	private boolean Created;
+	private boolean AlwaysReleaseLockWhenRedo;
+
+	private Transaction() {
+	}
+
+	public ArrayList<Procedure> getProcedureStack() {
+		return ProcedureStack;
+	}
+
+	TreeMap<TableKey, RecordAccessed> getAccessedRecords() {
+		return AccessedRecords;
+	}
+
+	public Procedure getTopProcedure() {
+		var stackSize = ProcedureStack.size();
+		return stackSize > 0 ? ProcedureStack.get(stackSize - 1) : null;
+	}
+
+	private void ReuseTransaction() {
+		// holdLocks.Clear(); // 执行完肯定清理了。
+		ProcedureStack.clear();
+		Savepoints.clear();
+		Actions.clear();
+		AccessedRecords.clear();
+		Locks = null;
+		State = TransactionState.Running;
+		Created = false;
+		AlwaysReleaseLockWhenRedo = false;
 	}
 
 	public void Begin() {
-		Savepoint sp = !Savepoints.isEmpty() ? Savepoints.get(Savepoints.size() - 1).Duplicate() : new Savepoint();
-		Savepoints.add(sp);
+		var saveSize = Savepoints.size();
+		Savepoints.add(saveSize > 0 ? Savepoints.get(saveSize - 1).BeginSavepoint() : new Savepoint());
 	}
 
 	public void Commit() {
-		if (Savepoints.size() > 1) {
-			// 嵌套事务，把日志合并到上一层。
-			int lastIndex = Savepoints.size() - 1;
-			Savepoint last = Savepoints.get(lastIndex);
-			Savepoints.remove(lastIndex);
-			Savepoints.get(Savepoints.size() - 1).MergeFrom(last, true);
-		}
+		int saveSize = Savepoints.size();
+		if (saveSize > 1)
+			Savepoints.get(saveSize - 2).MergeCommitFrom(Savepoints.remove(saveSize - 1)); // 嵌套事务，把日志合并到上一层。
+		// else // 最外层存储过程提交在 Perform 中处理
 	}
 
 	public void Rollback() {
-
-		// 嵌套事务，把日志合并到上一层。
 		int lastIndex = Savepoints.size() - 1;
-		Savepoint last = Savepoints.get(lastIndex);
-		Savepoints.remove(lastIndex);
-		if (lastIndex > 0) {
-			Savepoints.get(Savepoints.size() - 1).MergeFrom(last, false);
-		} else {
-			last.MergeActions(Actions, false);
-		}
-
+		Savepoint last = Savepoints.remove(lastIndex);
+		// last.Rollback();
+		if (lastIndex > 0)
+			Savepoints.get(lastIndex - 1).MergeRollbackFrom(last); // 嵌套事务，把日志合并到上一层。
+		else
+			last.MergeRollbackActions(Actions);
 	}
 
 	public Log LogGetOrAdd(long logKey, Supplier<Log> logFactory) {
@@ -106,7 +102,8 @@ public final class Transaction {
 	public Log GetLog(long key) {
 		VerifyRunningOrCompleted();
 		// 允许没有 savepoint 时返回 null. 就是说允许在保存点不存在时进行读取操作。
-		return !Savepoints.isEmpty() ? Savepoints.get(Savepoints.size() - 1).GetLog(key) : null;
+		var saveSize = Savepoints.size();
+		return saveSize > 0 ? Savepoints.get(saveSize - 1).GetLog(key) : null;
 	}
 
 	public void PutLog(Log log) {
@@ -114,127 +111,148 @@ public final class Transaction {
 		Savepoints.get(Savepoints.size() - 1).PutLog(log);
 	}
 
-	public void RunWhileCommit(Runnable action) {
+	public static void whileCommit(Runnable action) {
+		//noinspection ConstantConditions
+		getCurrent().runWhileCommit(action);
+	}
+
+	public static void whileRollback(Runnable action) {
+		//noinspection ConstantConditions
+		getCurrent().runWhileRollback(action);
+	}
+
+	public void runWhileCommit(Runnable action) {
 		VerifyRunning();
 		Savepoints.get(Savepoints.size() - 1).addCommitAction(action);
 	}
 
-	public void RunWhileRollback(Runnable action) {
+	public void runWhileRollback(Runnable action) {
 		VerifyRunning();
 		Savepoints.get(Savepoints.size() - 1).addRollbackAction(action);
 	}
 
-	TableKey LastTableKeyOfRedoAndRelease;
-	long LastGlobalSerialIdOfRedoAndRelease;
-	private boolean AlwaysReleaseLockWhenRedo = false;
+	@Deprecated
+	public void RunWhileCommit(Runnable action) {
+		runWhileCommit(action);
+	}
+
+	@Deprecated
+	public void RunWhileRollback(Runnable action) {
+		runWhileRollback(action);
+	}
+
 	void SetAlwaysReleaseLockWhenRedo() {
 		AlwaysReleaseLockWhenRedo = true;
-		if (holdLocks.size() > 0)
-			this.ThrowRedo();
+		if (!holdLocks.isEmpty())
+			ThrowRedo();
 	}
 
 	/**
-	 Procedure 第一层入口，总的处理流程，包括重做和所有错误处理。
-
-	 @param procedure first procedure
-	*/
+	 * Procedure 第一层入口，总的处理流程，包括重做和所有错误处理。
+	 *
+	 * @param procedure first procedure
+	 */
 	public long Perform(Procedure procedure) {
 		try {
+			var checkpoint = procedure.getZeze().getCheckpoint();
+			if (checkpoint == null)
+				return Procedure.Closed;
 			for (int tryCount = 0; tryCount < 256; ++tryCount) { // 最多尝试次数
 				// 默认在锁内重复尝试，除非CheckResult.RedoAndReleaseLock，否则由于CheckResult.Redo保持锁会导致死锁。
-				procedure.getZeze().getCheckpoint().EnterFlushReadLock();
+				checkpoint.EnterFlushReadLock();
 				try {
 					for (; tryCount < 256; ++tryCount) { // 最多尝试次数
 						CheckResult checkResult = CheckResult.Redo; // 用来决定是否释放锁，除非 _lock_and_check_ 明确返回需要释放锁，否则都不释放。
 						try {
-							LastTableKeyOfRedoAndRelease = null;
 							var result = procedure.Call();
 							switch (State) {
-								case Running:
-									if ((result == Procedure.Success && Savepoints.size() != 1) || (result != Procedure.Success && !Savepoints.isEmpty())) {
-										// 这个错误不应该重做
-										logger.fatal("Transaction.Perform:{}. savepoints.Count != 1.", procedure);
-										_final_rollback_(procedure);
-										return Procedure.ErrorSavepoint;
-									}
-									checkResult = _lock_and_check_(procedure.getTransactionLevel());
-									if (checkResult == CheckResult.Success) {
-										if (result == Procedure.Success) {
-											_final_commit_(procedure);
-											// 正常一次成功的不统计，用来观察redo多不多。
-											// 失败在 Procedure.cs 中的统计。
-											if (tryCount > 0) {
-												ProcedureStatistics.getInstance().GetOrAdd("Zeze.Transaction.TryCount").GetOrAdd(tryCount).incrementAndGet();
-											}
-											return Procedure.Success;
+							case Running:
+								var saveSize = Savepoints.size();
+								if ((result == Procedure.Success && saveSize != 1)
+										|| (result != Procedure.Success && saveSize > 0)) {
+									// 这个错误不应该重做
+									logger.fatal("Transaction.Perform:{}. savepoints.Count != 1.", procedure);
+									finalRollback(procedure);
+									return Procedure.ErrorSavepoint;
+								}
+								checkResult = lockAndCheck(procedure.getTransactionLevel());
+								if (checkResult == CheckResult.Success) {
+									if (result == Procedure.Success) {
+										finalCommit(procedure);
+										// 正常一次成功的不统计，用来观察redo多不多。
+										// 失败在 Procedure.cs 中的统计。
+										if (tryCount > 0) {
+											ProcedureStatistics.getInstance().GetOrAdd("Zeze.Transaction.TryCount").GetOrAdd(tryCount).increment();
 										}
-										_final_rollback_(procedure, true);
-										return result;
+										return Procedure.Success;
 									}
-									break; // retry
+									finalRollback(procedure, true);
+									return result;
+								}
+								break; // retry
 
-								case Abort:
-									logger.debug("Transaction.Perform: Abort");
-									_final_rollback_(procedure);
-									return Procedure.AbortException;
+							case Abort:
+								logger.warn("Transaction.Perform: Abort");
+								finalRollback(procedure);
+								return Procedure.AbortException;
 
-								case Redo:
-									//checkResult = CheckResult.Redo;
-									break; // retry
+							case Redo:
+								//checkResult = CheckResult.Redo;
+								break; // retry
 
-								case RedoAndReleaseLock:
-									checkResult = CheckResult.RedoAndReleaseLock;
-									break; // retry
+							case RedoAndReleaseLock:
+								checkResult = CheckResult.RedoAndReleaseLock;
+								break; // retry
 							}
 							// retry clear in finally
 							if (AlwaysReleaseLockWhenRedo && checkResult == CheckResult.Redo)
 								checkResult = CheckResult.RedoAndReleaseLock;
-						}
-						catch (Throwable e) {
+						} catch (Throwable e) {
 							// Procedure.Call 里面已经处理了异常。只有 unit test 或者重做或者内部错误会到达这里。
 							// 在 unit test 下，异常日志会被记录两次。
 							switch (State) {
-								case Running:
-									logger.error("Transaction.Perform:{} exception. run count:{}", procedure, tryCount, e);
-									if (!Savepoints.isEmpty()) {
-										// 这个错误不应该重做
-										logger.fatal("Transaction.Perform:{}. exception. savepoints.Count != 0.", procedure, e);
-										_final_rollback_(procedure);
-										return Procedure.ErrorSavepoint;
-									}
-									// 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
-									if (e instanceof AssertionError) {
-										_final_rollback_(procedure);
-										throw (AssertionError)e;
-									}
-									checkResult = _lock_and_check_(procedure.getTransactionLevel());
-									if (checkResult == CheckResult.Success) {
-										_final_rollback_(procedure, true);
-										return Procedure.Exception;
-									}
-									// retry
-									break;
+							case Running:
+								logger.error("Transaction.Perform:{} exception. run count:{}", procedure, tryCount, e);
+								if (!Savepoints.isEmpty()) {
+									// 这个错误不应该重做
+									logger.fatal("Transaction.Perform:{}. exception. savepoints.Count != 0.", procedure, e);
+									finalRollback(procedure);
+									return Procedure.ErrorSavepoint;
+								}
+								// 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+								if (e instanceof AssertionError) {
+									finalRollback(procedure);
+									throw (AssertionError)e;
+								}
+								checkResult = lockAndCheck(procedure.getTransactionLevel());
+								if (checkResult == CheckResult.Success) {
+									finalRollback(procedure, true);
+									return Procedure.Exception;
+								}
+								// retry
+								break;
 
-								case Abort:
-									logger.debug("Transaction.Perform: Abort");
-									_final_rollback_(procedure);
-									return Procedure.AbortException;
+							case Abort:
+								logger.warn("Transaction.Perform: Abort", e);
+								finalRollback(procedure);
+								return Procedure.AbortException;
 
-								case Redo:
-									checkResult = CheckResult.Redo;
-									break;
+							case Redo:
+								checkResult = CheckResult.Redo;
+								break;
 
-								case RedoAndReleaseLock:
-									checkResult = CheckResult.RedoAndReleaseLock;
-									break;
+							case RedoAndReleaseLock:
+								checkResult = CheckResult.RedoAndReleaseLock;
+								break;
+
+							default: // case Completed:
+								if (e instanceof AssertionError)
+									throw (AssertionError)e;
 							}
 							// retry
-						}
-						finally {
+						} finally {
 							if (checkResult == CheckResult.RedoAndReleaseLock) {
-								for (var holdLock : holdLocks) {
-									holdLock.ExitLock();
-								}
+								holdLocks.forEach(Lockey::ExitLock);
 								holdLocks.clear();
 							}
 							// retry 可能保持已有的锁，清除记录和保存点。
@@ -246,26 +264,26 @@ public final class Transaction {
 						}
 
 						if (checkResult == CheckResult.RedoAndReleaseLock) {
-							//logger.Debug("CheckResult.RedoAndReleaseLock break {0}", procedure);
+							// logger.debug("CheckResult.RedoAndReleaseLock break {}", procedure);
 							break;
 						}
 					}
-				}
-				finally {
-					procedure.getZeze().getCheckpoint().ExitFlushReadLock();
+				} finally {
+					checkpoint.ExitFlushReadLock();
 				}
 				//logger.Debug("Checkpoint.WaitRun {0}", procedure);
-				if (null != LastTableKeyOfRedoAndRelease)
-					procedure.getZeze().__TryWaitFlushWhenReduce(LastTableKeyOfRedoAndRelease, LastGlobalSerialIdOfRedoAndRelease);
+				// 实现Fresh队列以后删除Sleep。
+				try {
+					Thread.sleep(Zeze.Util.Random.getInstance().nextInt(80) + 20);
+				} catch (InterruptedException e) {
+					logger.error("", e);
+				}
 			}
 			logger.error("Transaction.Perform:{}. too many try.", procedure);
-			_final_rollback_(procedure);
+			finalRollback(procedure);
 			return Procedure.TooManyTry;
-		}
-		finally {
-			for (var holdLock : holdLocks) {
-				holdLock.ExitLock();
-			}
+		} finally {
+			holdLocks.forEach(Lockey::ExitLock);
 			holdLocks.clear();
 		}
 	}
@@ -274,6 +292,8 @@ public final class Transaction {
 		for (var action : Actions) {
 			try {
 				action.action.run();
+			} catch (AssertionError e) {
+				throw e;
 			} catch (Throwable e) {
 				String typeStr;
 				if (action.actionType == Savepoint.ActionType.COMMIT) {
@@ -296,25 +316,25 @@ public final class Transaction {
 		triggerActions(procedure);
 	}
 
-	private void _final_commit_(Procedure procedure) {
+	private void finalCommit(Procedure procedure) {
 		// 下面不允许失败了，因为最终提交失败，数据可能不一致，而且没法恢复。
 		// 可以在最终提交里可以实现每事务checkpoint。
-		var lastsp = Savepoints.get(Savepoints.size() - 1);
+		var lastSp = Savepoints.get(Savepoints.size() - 1);
 		RelativeRecordSet.TryUpdateAndCheckpoint(this, procedure, () -> {
-				try {
-					lastsp.MergeActions(Actions, true);
-					lastsp.Commit();
-
-					for (var e : getAccessedRecords().entrySet()) {
-						if (e.getValue().Dirty) {
-							e.getValue().Origin.Commit(e.getValue());
-						}
+			try {
+				lastSp.MergeCommitActions(Actions);
+				lastSp.Commit();
+				for (var v : AccessedRecords.values()) {
+					v.AtomicTupleRecord.Record.setNotFresh();
+					if (v.Dirty) {
+						v.AtomicTupleRecord.Record.Commit(v);
 					}
 				}
-				catch (Throwable e) {
-					logger.error("Transaction._final_commit_ {}", procedure, e);
-					Runtime.getRuntime().halt(54321);
-				}
+			} catch (Throwable e) {
+				logger.fatal("Transaction.finalCommit {}", procedure, e);
+				LogManager.shutdown();
+				Runtime.getRuntime().halt(54321);
+			}
 		});
 
 		// 禁止在listener回调中访问表格的操作。除了回调参数中给定的记录可以访问。
@@ -325,62 +345,62 @@ public final class Transaction {
 		// collect logs and notify listeners
 		try {
 			var cc = new Changes(this);
-			lastsp.getLogs().foreachValue((log) -> {
-				// 这里都是修改操作的日志，没有Owner的日志是特殊测试目的加入的，简单忽略即可。
-				if (log.getBelong() != null && log.getBelong().isManaged()) {
-					// 第一个参数Owner为null，表示bean属于record，到达root了。
-					cc.Collect(log.getBelong(), log);
+			var it = lastSp.logIterator();
+			if (it != null) {
+				while (it.moveToNext()) {
+					var log = it.value();
+					var logBelong = log.getBelong();
+					// 这里都是修改操作的日志，没有Owner的日志是特殊测试目的加入的，简单忽略即可。
+					if (logBelong != null && logBelong.isManaged()) {
+						// 第一个参数Owner为null，表示bean属于record，到达root了。
+						cc.Collect(logBelong, log);
+					}
 				}
-			});
+			}
 
-			for (var ar : AccessedRecords.values())
-			{
+			for (var ar : AccessedRecords.values()) {
 				if (ar.Dirty)
 					cc.CollectRecord(ar);
 			}
 			cc.NotifyListener();
 		} catch (Throwable ex) {
-			logger.error(ex);
+			logger.error("", ex);
 		}
 
 		_trigger_commit_actions_(procedure);
 	}
 
-	private void _final_rollback_(Procedure procedure) {
-		_final_rollback_(procedure, false);
+	private void finalRollback(Procedure procedure) {
+		finalRollback(procedure, false);
 	}
 
-	private void _final_rollback_(Procedure procedure, boolean executeRollbackAction) {
+	private void finalRollback(Procedure procedure, boolean executeRollbackAction) {
+		for (var ra : AccessedRecords.values()) {
+			ra.AtomicTupleRecord.Record.setNotFresh();
+		}
+		Savepoints.clear(); // 这里可以安全的清除日志，这样如果 rollback_action 需要读取数据，将读到原始的。
 		State = TransactionState.Completed;
 		if (executeRollbackAction) {
 			_trigger_rollback_actions_(procedure);
 		}
 	}
 
-	private final ArrayList<Lockey> holdLocks = new ArrayList<>(); // 读写锁的话需要一个包装类，用来记录当前维持的是哪个锁。
-
-	private final TreeMap<TableKey, RecordAccessed> AccessedRecords = new TreeMap<> ();
-	public TreeMap<TableKey, RecordAccessed> getAccessedRecords() {
-		return AccessedRecords;
-	}
-	private final ArrayList<Savepoint> Savepoints = new ArrayList<>();
-
 	/**
-	 只能添加一次。
-	 @param r record accessed
-	*/
+	 * 只能添加一次。
+	 *
+	 * @param r record accessed
+	 */
 	void AddRecordAccessed(Record.RootInfo root, RecordAccessed r) {
 		VerifyRunning();
 		r.InitRootInfo(root, null);
-		getAccessedRecords().put(root.getTableKey(), r);
+		AccessedRecords.put(root.getTableKey(), r);
 	}
 
 	public RecordAccessed GetRecordAccessed(TableKey key) {
 		// 允许读取事务内访问过的记录。
 		VerifyRunningOrCompleted();
-		return getAccessedRecords().get(key);
+		return AccessedRecords.get(key);
 	}
-
 
 	public void VerifyRecordAccessed(Bean bean) {
 		VerifyRecordAccessed(bean, false);
@@ -388,7 +408,7 @@ public final class Transaction {
 
 	public void VerifyRecordAccessed(Bean bean, @SuppressWarnings("unused") boolean IsRead) {
 		if (IsRead)
-		    return; // allow read
+			return; // allow read
 
 		if (bean.RootInfo.getRecord().getState() == GlobalCacheManagerServer.StateRemoved) {
 			ThrowRedo(); // 这个错误需要redo。不是逻辑错误。
@@ -397,14 +417,14 @@ public final class Transaction {
 		if (ra == null) {
 			throw new IllegalStateException("VerifyRecordAccessed: Record Not Control Under Current Transaction. " + bean.getTableKey());
 		}
-		if (bean.RootInfo.getRecord() != ra.Origin) {
+		if (bean.RootInfo.getRecord() != ra.AtomicTupleRecord.Record) {
 			throw new IllegalStateException("VerifyRecordAccessed: Record Reloaded. " + bean.getTableKey());
 		}
 		// 事务结束后可能会触发Listener，此时Commit已经完成，Timestamp已经改变，
 		// 这种情况下不做RedoCheck，当然Listener的访问数据是只读的。
-		if (ra.Origin.getTable().getZeze().getConfig().getFastRedoWhenConflict()
+		if (ra.AtomicTupleRecord.Record.getTable().getZeze().getConfig().getFastRedoWhenConflict()
 				&& State != TransactionState.Completed
-				&& ra.Origin.getTimestamp() != ra.Timestamp) {
+				&& ra.AtomicTupleRecord.Record.getTimestamp() != ra.AtomicTupleRecord.Timestamp) {
 			ThrowRedo();
 		}
 	}
@@ -416,59 +436,51 @@ public final class Transaction {
 	}
 
 	private CheckResult _check_(boolean writeLock, RecordAccessed e) {
-		e.Origin.EnterFairLock();
+		e.AtomicTupleRecord.Record.EnterFairLock();
 		try {
-			//noinspection IfStatementWithIdenticalBranches
 			if (writeLock) {
-				switch (e.Origin.getState()) {
-					case GlobalCacheManagerServer.StateRemoved:
-						// 被从cache中清除，不持有该记录的Global锁，简单重做即可。
-						return CheckResult.Redo;
+				switch (e.AtomicTupleRecord.Record.getState()) {
+				case GlobalCacheManagerServer.StateRemoved:
+					// 被从cache中清除，不持有该记录的Global锁，简单重做即可。
+					return CheckResult.Redo;
 
-					case GlobalCacheManagerServer.StateInvalid:
-						LastTableKeyOfRedoAndRelease = e.getTableKey();
-						LastGlobalSerialIdOfRedoAndRelease = e.Origin.LastErrorGlobalSerialId;
-						return CheckResult.RedoAndReleaseLock; // 写锁发现Invalid，可能有Reduce请求。
+				case GlobalCacheManagerServer.StateInvalid:
+					return CheckResult.RedoAndReleaseLock; // 写锁发现Invalid，可能有Reduce请求。
 
-					case GlobalCacheManagerServer.StateModify:
-						return e.Timestamp != e.Origin.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+				case GlobalCacheManagerServer.StateModify:
+					return e.AtomicTupleRecord.Timestamp != e.AtomicTupleRecord.Record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
 
-					case GlobalCacheManagerServer.StateShare:
-						// 这里可能死锁：另一个先获得提升的请求要求本机Reduce，但是本机Checkpoint无法进行下去，被当前事务挡住了。
-						// 通过 GlobalCacheManager 检查死锁，返回失败;需要重做并释放锁。
-						var acquire = e.Origin.Acquire(GlobalCacheManagerServer.StateModify);
-						if (acquire.ResultState != GlobalCacheManagerServer.StateModify) {
-							logger.debug("Acquire Failed. Maybe DeadLock Found {}", e.Origin);
-							e.Origin.setState(GlobalCacheManagerServer.StateInvalid); // 这里保留StateShare更好吗？
-							LastTableKeyOfRedoAndRelease = e.getTableKey();
-							e.Origin.LastErrorGlobalSerialId = acquire.ResultGlobalSerialId; // save
-							LastGlobalSerialIdOfRedoAndRelease = acquire.ResultGlobalSerialId;
-							return CheckResult.RedoAndReleaseLock;
-						}
-						e.Origin.setState(GlobalCacheManagerServer.StateModify);
-						return e.Timestamp != e.Origin.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+				case GlobalCacheManagerServer.StateShare:
+					// 这里可能死锁：另一个先获得提升的请求要求本机Reduce，但是本机Checkpoint无法进行下去，被当前事务挡住了。
+					// 通过 GlobalCacheManager 检查死锁，返回失败;需要重做并释放锁。
+					var acquire = e.AtomicTupleRecord.Record.Acquire(
+							GlobalCacheManagerServer.StateModify, e.AtomicTupleRecord.Record.isFresh());
+					if (acquire.ResultState != GlobalCacheManagerServer.StateModify) {
+						e.AtomicTupleRecord.Record.setNotFresh(); // 抢失败不再新鲜。
+						logger.debug("Acquire Failed. Maybe DeadLock Found {}", e.AtomicTupleRecord);
+						e.AtomicTupleRecord.Record.setState(GlobalCacheManagerServer.StateInvalid); // 这里保留StateShare更好吗？
+						return CheckResult.RedoAndReleaseLock;
+					}
+					e.AtomicTupleRecord.Record.setState(GlobalCacheManagerServer.StateModify);
+					return e.AtomicTupleRecord.Timestamp != e.AtomicTupleRecord.Record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
 				}
-				return e.Timestamp != e.Origin.getTimestamp() ? CheckResult.Redo : CheckResult.Success; // impossible
+				return e.AtomicTupleRecord.Timestamp != e.AtomicTupleRecord.Record.getTimestamp() ? CheckResult.Redo : CheckResult.Success; // impossible
 			}
-			else {
-				switch (e.Origin.getState()) {
-					case GlobalCacheManagerServer.StateRemoved:
-						// 被从cache中清除，不持有该记录的Global锁，简单重做即可。
-						return CheckResult.Redo;
+			switch (e.AtomicTupleRecord.Record.getState()) {
+			case GlobalCacheManagerServer.StateRemoved:
+				// 被从cache中清除，不持有该记录的Global锁，简单重做即可。
+				return CheckResult.Redo;
 
-					case GlobalCacheManagerServer.StateInvalid:
-						LastTableKeyOfRedoAndRelease = e.getTableKey();
-						LastGlobalSerialIdOfRedoAndRelease = e.Origin.LastErrorGlobalSerialId;
-						return CheckResult.RedoAndReleaseLock; // 发现Invalid，可能有Reduce请求或者被Cache清理，此时保险起见释放锁。
-				}
-				return e.Timestamp != e.Origin.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
+			case GlobalCacheManagerServer.StateInvalid:
+				return CheckResult.RedoAndReleaseLock; // 发现Invalid，可能有Reduce请求或者被Cache清理，此时保险起见释放锁。
 			}
+			return e.AtomicTupleRecord.Timestamp != e.AtomicTupleRecord.Record.getTimestamp() ? CheckResult.Redo : CheckResult.Success;
 		} finally {
-			e.Origin.ExitFairLock();
+			e.AtomicTupleRecord.Record.ExitFairLock();
 		}
 	}
 
-	private CheckResult _lock_and_check_(Map.Entry<TableKey, RecordAccessed> e) {
+	private CheckResult lockAndCheck(Map.Entry<TableKey, RecordAccessed> e) {
 		Lockey lockey = Locks.Get(e.getKey());
 		boolean writeLock = e.getValue().Dirty;
 		lockey.EnterLock(writeLock);
@@ -476,26 +488,30 @@ public final class Transaction {
 		return _check_(writeLock, e.getValue());
 	}
 
-	private CheckResult _lock_and_check_(TransactionLevel level) {
+	private CheckResult lockAndCheck(TransactionLevel level) {
 		boolean allRead = true;
-		if (!Savepoints.isEmpty()) {
+		var saveSize = Savepoints.size();
+		if (saveSize > 0) {
 			// 全部 Rollback 时 Count 为 0；最后提交时 Count 必须为 1；
 			// 其他情况属于Begin,Commit,Rollback不匹配。外面检查。
-			for (var it = Savepoints.get(Savepoints.size() - 1).getLogs().iterator(); it.moveToNext(); ) {
-				// 特殊日志。不是 bean 的修改日志，当然也不会修改 Record。
-				// 现在不会有这种情况，保留给未来扩展需要。
-				Log log = it.value();
-				if (log.getBean() == null)
-					continue;
+			var it = Savepoints.get(saveSize - 1).logIterator();
+			if (it != null) {
+				while (it.moveToNext()) {
+					// 特殊日志。不是 bean 的修改日志，当然也不会修改 Record。
+					// 现在不会有这种情况，保留给未来扩展需要。
+					Log log = it.value();
+					if (log.getBean() == null)
+						continue;
 
-				TableKey tkey = log.getBean().getTableKey();
-				var record = AccessedRecords.get(tkey);
-				if (record != null) {
-					record.Dirty = true;
-					allRead = false;
-				} else {
-					// 只有测试代码会把非 Managed 的 Bean 的日志加进来。
-					logger.fatal("impossible! record not found.");
+					TableKey tkey = log.getBean().getTableKey();
+					var record = AccessedRecords.get(tkey);
+					if (record != null) {
+						record.Dirty = true;
+						allRead = false;
+					} else {
+						// 只有测试代码会把非 Managed 的 Bean 的日志加进来。
+						logger.fatal("impossible! record not found.");
+					}
 				}
 			}
 		}
@@ -505,15 +521,16 @@ public final class Transaction {
 
 		boolean conflict = false; // 冲突了，也继续加锁，为重做做准备！！！
 		if (holdLocks.isEmpty()) {
-			for (var e : getAccessedRecords().entrySet()) {
-				switch (_lock_and_check_(e)) {
-					case Success:
-						break;
-					case Redo:
-						conflict = true;
-						break; // continue lock
-					case RedoAndReleaseLock:
-						return CheckResult.RedoAndReleaseLock;
+			for (var e : AccessedRecords.entrySet()) {
+				var r = lockAndCheck(e);
+				switch (r) {
+				case Success:
+					break;
+				case Redo:
+					conflict = true;
+					break; // continue lock
+				default:
+					return r;
 				}
 			}
 			return conflict ? CheckResult.Redo : CheckResult.Success;
@@ -521,19 +538,20 @@ public final class Transaction {
 
 		int index = 0;
 		int n = holdLocks.size();
-		final var ite = getAccessedRecords().entrySet().iterator();
+		final var ite = AccessedRecords.entrySet().iterator();
 		var e = ite.hasNext() ? ite.next() : null;
 		while (null != e) {
 			// 如果 holdLocks 全部被对比完毕，直接锁定它
 			if (index >= n) {
-				switch (_lock_and_check_(e)) {
-					case Success:
-						break;
-					case Redo:
-						conflict = true;
-						break; // continue lock
-					case RedoAndReleaseLock:
-						return CheckResult.RedoAndReleaseLock;
+				var r = lockAndCheck(e);
+				switch (r) {
+				case Success:
+					break;
+				case Redo:
+					conflict = true;
+					break; // continue lock
+				default:
+					return r;
 				}
 				e = ite.hasNext() ? ite.next() : null;
 				continue;
@@ -554,8 +572,20 @@ public final class Transaction {
 					// 重新从当前 e 继续锁。
 					continue;
 				}
-				// else 已经持有读锁，不可能被修改也不可能降级(reduce)，所以不做检测了。
-				// 已经锁定了，跳过当前锁，比较下一个。
+				// BUG 即使锁内。Record.Global.State 可能没有提升到需要水平。需要重新_check_。
+				var r = _check_(e.getValue().Dirty, e.getValue());
+				switch (r) {
+				case Success:
+					// 已经锁内，所以肯定不会冲突，多数情况是这个。
+					break;
+				case Redo:
+					// Impossible!
+					conflict = true;
+					break; // continue lock
+				default:
+					// _check_可能需要到Global提升状态，这里可能发生GLOBAL-DEAD-LOCK。
+					return r;
+				}
 				++index;
 				e = ite.hasNext() ? ite.next() : null;
 				continue;
@@ -565,10 +595,8 @@ public final class Transaction {
 			if (c < 0) {
 				// 释放掉 比当前锁序小的锁，因为当前事务中不再需要这些锁
 				int unlockEndIndex = index;
-				for (; unlockEndIndex < n && holdLocks.get(unlockEndIndex).getTableKey().compareTo(e.getKey()) < 0; ++unlockEndIndex) {
-					var toUnlockLocker = holdLocks.get(unlockEndIndex);
-					toUnlockLocker.ExitLock();
-				}
+				for (; unlockEndIndex < n && holdLocks.get(unlockEndIndex).getTableKey().compareTo(e.getKey()) < 0; ++unlockEndIndex)
+					holdLocks.get(unlockEndIndex).ExitLock();
 				holdLocks.subList(index, unlockEndIndex).clear();
 				n = holdLocks.size();
 				// 重新从当前 e 继续锁。
@@ -585,25 +613,16 @@ public final class Transaction {
 	}
 
 	private int _unlock_start_(int index, int nLast) {
-		for (int i = index; i < nLast; ++i) {
-			var toUnlockLocker = holdLocks.get(i);
-			toUnlockLocker.ExitLock();
-		}
+		for (int i = index; i < nLast; ++i)
+			holdLocks.get(i).ExitLock();
 		holdLocks.subList(index, nLast).clear();
 		return holdLocks.size();
-	}
-
-	private TransactionState State = TransactionState.Running;
-
-	public TransactionState getState() {
-		return State;
 	}
 
 	public void ThrowAbort(String msg, Throwable cause) {
 		if (State != TransactionState.Running)
 			throw new IllegalStateException("Abort: State Is Not Running.");
 		State = TransactionState.Abort;
-		//noinspection ConstantConditions
 		GoBackZeze.Throw(msg, cause);
 	}
 
@@ -612,8 +631,7 @@ public final class Transaction {
 			throw new IllegalStateException("RedoAndReleaseLock: State Is Not Running.");
 		State = TransactionState.RedoAndReleaseLock;
 		//noinspection ConstantConditions
-		ProcedureStatistics.getInstance().GetOrAdd(getTopProcedure().getActionName()).GetOrAdd(Procedure.RedoAndRelease).incrementAndGet();
-		//noinspection ConstantConditions
+		ProcedureStatistics.getInstance().GetOrAdd(getTopProcedure().getActionName()).GetOrAdd(Procedure.RedoAndRelease).increment();
 		GoBackZeze.Throw(msg, cause);
 	}
 
@@ -621,26 +639,16 @@ public final class Transaction {
 		if (State != TransactionState.Running)
 			throw new IllegalStateException("RedoAndReleaseLock: State Is Not Running.");
 		State = TransactionState.Redo;
-		//noinspection ConstantConditions
 		GoBackZeze.Throw("Redo", null);
 	}
 
 	public void VerifyRunning() {
-		//noinspection SwitchStatementWithTooFewBranches
-		switch (State) {
-			case Running:
-				return;
-			default:
-				throw new IllegalStateException("State Is Not Running");
-		}
+		if (State != TransactionState.Running)
+			throw new IllegalStateException("State Is Not Running");
 	}
 
 	public void VerifyRunningOrCompleted() {
-		switch (State) {
-			case Running: case Completed:
-				return;
-			default:
-				throw new IllegalStateException("State Is Not RunningOrCompleted");
-		}
+		if (State != TransactionState.Running && State != TransactionState.Completed)
+			throw new IllegalStateException("State Is Not RunningOrCompleted");
 	}
 }

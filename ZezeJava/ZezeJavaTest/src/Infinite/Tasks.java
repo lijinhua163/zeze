@@ -5,7 +5,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Transaction.DatabaseMemory;
@@ -13,27 +13,30 @@ import Zeze.Transaction.Procedure;
 import Zeze.Transaction.ProcedureStatistics;
 import Zeze.Transaction.Transaction;
 import Zeze.Util.FuncLong;
+import Zeze.Util.LongConcurrentHashMap;
 import Zeze.Util.Random;
 import org.junit.Assert;
 
 public final class Tasks {
-	private static final ConcurrentHashMap<String, ConcurrentHashMap<Long, AtomicLong>> CounterRun = new ConcurrentHashMap<>();
-	private static final ConcurrentHashMap<String, ConcurrentHashMap<Long, AtomicLong>> CounterSuccess = new ConcurrentHashMap<>();
+	private static final boolean debugTradeSum = false;
+	private static final ConcurrentHashMap<String, LongConcurrentHashMap<LongAdder>> CounterKey = new ConcurrentHashMap<>();
+	private static final ConcurrentHashMap<String, LongAdder> CounterRun = new ConcurrentHashMap<>();
+	private static final ConcurrentHashMap<String, LongAdder> CounterSuccess = new ConcurrentHashMap<>();
 
-	static ConcurrentHashMap<Long, AtomicLong> getRunCounters(String name) {
-		return CounterRun.computeIfAbsent(name, __ -> new ConcurrentHashMap<>());
+	static LongConcurrentHashMap<LongAdder> getKeyCounters(String name) {
+		return CounterKey.computeIfAbsent(name, __ -> new LongConcurrentHashMap<>());
 	}
 
-	static AtomicLong getRunCounter(String name, long key) {
-		return getRunCounters(name).computeIfAbsent(key, __ -> new AtomicLong());
+	static LongAdder getKeyCounter(String name, long key) {
+		return getKeyCounters(name).computeIfAbsent(key, __ -> new LongAdder());
 	}
 
-	static ConcurrentHashMap<Long, AtomicLong> getSuccessCounters(String name) {
-		return CounterSuccess.computeIfAbsent(name, __ -> new ConcurrentHashMap<>());
+	static LongAdder getRunCounter(String name) {
+		return CounterRun.computeIfAbsent(name, __ -> new LongAdder());
 	}
 
-	static AtomicLong getSuccessCounter(String name, long key) {
-		return getSuccessCounters(name).computeIfAbsent(key, __ -> new AtomicLong());
+	static LongAdder getSuccessCounter(String name) {
+		return CounterSuccess.computeIfAbsent(name, __ -> new LongAdder());
 	}
 
 	// 所有以long为key的记录访问可以使用这个基类。
@@ -66,45 +69,36 @@ public final class Tasks {
 		void verify() {
 			// default verify
 			var name = getClass().getName();
-			var runs = getRunCounters(name);
-			var success = getSuccessCounters(name);
-			var tooManyTry = ProcedureStatistics.getInstance().GetOrAdd(name).GetOrAdd(Procedure.TooManyTry).get();
+			var runCount = getRunCounter(name).sum();
+			var successCount = getSuccessCounter(name).sum();
+			var stats = ProcedureStatistics.getInstance().GetOrAdd(name);
+			var abortCount = stats.GetOrAdd(Procedure.AbortException).sum();
+			var tooManyTry = stats.GetOrAdd(Procedure.TooManyTry).sum();
+			Simulate.logger.info("  totalCount({})={}", name, runCount);
+			Simulate.logger.info("successCount({})={}", name, successCount);
+			if (abortCount != 0)
+				Simulate.logger.warn("  abortCount({})={}", name, abortCount);
 			if (tooManyTry != 0)
-				Simulate.logger.fatal("tooManyTry({})={}", name, tooManyTry);
-			if (runs.size() != success.size()) {
-				Simulate.logger.error("verify({}): {} != {}", name, runs.size(), success.size());
-				Assert.fail();
-			}
-			var totalCount = 0;
-			var successCount = 0;
-			for (var r : runs.entrySet()) {
-				totalCount += r.getValue().get();
-				var s = success.get(r.getKey());
-				Assert.assertNotNull(s);
-				successCount += s.get();
-			}
-			// ignore TooManyTry error
-			if (totalCount != successCount + tooManyTry) {
-				Simulate.logger.error("verify({}): {} != {} + {}", name, totalCount, successCount, tooManyTry);
+				Simulate.logger.warn("  tooManyTry({})={}", name, tooManyTry);
+			if (runCount != successCount + abortCount + tooManyTry) {
+				Simulate.logger.error("verify failed({}): {} != {} = {} + {} + {}",
+						name, runCount, successCount + abortCount + tooManyTry, successCount, abortCount, tooManyTry);
 				Assert.fail();
 			}
 		}
 
 		@Override
 		public long call() {
+			var name = getClass().getName();
 			var result = process();
 			if (result == 0) {
 				var txn = Transaction.getCurrent();
-				if (txn != null) {
-					txn.RunWhileCommit(() -> {
-						for (var key : Keys)
-							getSuccessCounter(getClass().getName(), key).incrementAndGet();
-					});
-				} else {
-					for (var key : Keys)
-						getSuccessCounter(getClass().getName(), key).incrementAndGet();
-				}
-			}
+				if (txn != null)
+					txn.runWhileCommit(() -> getSuccessCounter(name).increment());
+				else
+					getSuccessCounter(name).increment();
+			} else
+				Simulate.logger.error("{}.process() = {}", name, result);
 			return result;
 		}
 	}
@@ -152,8 +146,13 @@ public final class Tasks {
 	}
 
 	static void verify() {
-		for (var tf : taskFactorys)
-			tf.Factory.get().verify();
+		for (var tf : taskFactorys) {
+			try {
+				tf.Factory.get().verify();
+			} catch (Exception e) {
+				Simulate.logger.error("verify exception:", e);
+			}
+		}
 	}
 
 	static class Table1Long2Add1 extends Task {
@@ -177,12 +176,22 @@ public final class Tasks {
 
 		@Override
 		void verify() {
+			super.verify();
+
 			// verify 时，所有任务都执行完毕，不需要考虑并发。
 			var name = Table1Long2Add1.class.getName();
 			var app = Simulate.getInstance().randApp().app; // 任何一个app都能查到相同的结果。
-			var success = getSuccessCounters(name);
-			for (var key : getRunCounters(name).keySet())
-				Assert.assertEquals(app.demo_Module1.getTable1().selectDirty(key).getLong2(), success.get(key).get());
+			var success = getSuccessCounter(name).sum();
+			var sum = 0L;
+			for (var it = getKeyCounters(name).keyIterator(); it.hasNext(); ) {
+				var key = it.next();
+				var v1 = app.demo_Module1.getTable1().selectDirty(key);
+				if (v1 == null)
+					Simulate.logger.warn("app.demo_Module1.getTable1().selectDirty({}) = null", key);
+				else
+					sum += v1.getLong2();
+			}
+			Assert.assertEquals(success, sum);
 			Simulate.logger.debug("{}.verify OK!", name);
 		}
 	}
@@ -229,30 +238,51 @@ public final class Tasks {
 		@Override
 		long process() {
 			var it = Keys.iterator();
-			var v1 = App.demo_Module1.getTflush().getOrAdd(it.next());
-			var v2 = App.demo_Module1.getTflush().getOrAdd(it.next());
-			var money = Random.getInstance().nextInt(1000);
-			if (Random.getInstance().nextBoolean()) {
-				// random swap
-				var tmp = v1;
-				v1 = v2;
-				v2 = tmp;
+			long k1, k2;
+			if (Random.getInstance().nextBoolean()) { // random swap
+				k1 = it.next();
+				k2 = it.next();
+			} else {
+				k2 = it.next();
+				k1 = it.next();
 			}
-			v1.setInt1(v1.getInt1() - money);
-			v2.setInt1(v2.getInt1() + money);
+			var v1 = App.demo_Module1.getTflush().getOrAdd(k1);
+			var v2 = App.demo_Module1.getTflush().getOrAdd(k2);
+			var m1 = v1.getInt1();
+			var m2 = v2.getInt1();
+			var money = Random.getInstance().nextInt(1000);
+			v1.setInt1(m1 - money);
+			v2.setInt1(m2 + money);
+			var r1 = v1.getInt1();
+			var r2 = v2.getInt1();
+			if (debugTradeSum) {
+				//noinspection ConstantConditions
+				Transaction.getCurrent().runWhileCommit(() ->
+						Simulate.logger.info("{} --- {}:{}-{}={} {}:{}+{}={}",
+								App.getZeze().getConfig().getServerId(), k1, m1, money, r1, k2, m2, money, r2));
+			}
 			return 0L;
 		}
 
 		@Override
 		void verify() {
+			super.verify();
+
 			var app = Simulate.getInstance().randApp().app; // 任何一个app都能查到相同的结果。
 			int sum = 0;
 			for (int key = 0; key < KeyBoundTrade; key++) {
-				var value = app.demo_Module1.getTable1().selectDirty((long)key);
-				if (value != null)
-					sum += value.getInt1();
+				try {
+					var value = app.demo_Module1.getTable1().selectDirty((long)key);
+					if (value != null)
+						sum += value.getInt1();
+				} catch (IllegalStateException e) {
+					if ("Acquire Failed".equals(e.getMessage()))
+						key--; // retry
+					else
+						throw e;
+				}
 			}
-			Assert.assertEquals(sum, 0);
+			Assert.assertEquals(0, sum);
 		}
 	}
 
@@ -290,7 +320,19 @@ public final class Tasks {
 						if (valueBytes != null)
 							sum += table1.DecodeValue(valueBytes).getInt1();
 					}
-					Assert.assertEquals(sum, 0);
+					if (debugTradeSum && sum != 0) {
+						for (var e : all.entrySet()) {
+							var valueBytes = e.getValue();
+							if (valueBytes != null) {
+								valueBytes.ReadIndex = 0;
+								e.getKey().ReadIndex = 0;
+								// var k = table1.DecodeKey(e.getKey());
+								// var v = table1.DecodeValue(valueBytes).getInt1();
+								// Simulate.logger.info("=== {}:{}", k, v);
+							}
+						}
+					}
+					Assert.assertEquals(0, sum);
 				}
 			} catch (Exception e) {
 				Simulate.logger.error(tflushInt1TradeConcurrentVerify.class.getName(), e);

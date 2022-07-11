@@ -7,7 +7,6 @@ import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 import Zeze.Util.Task;
 import Zeze.Util.ThreadFactoryWithName;
@@ -18,7 +17,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.LoggerContext;
 
-@SuppressWarnings({"unused", "FieldCanBeLocal", "FieldMayBeFinal"})
+@SuppressWarnings({"unused", "FieldCanBeLocal", "FieldMayBeFinal", "CanBeFinal"})
 public class Simulate {
 	static {
 		System.setProperty("log4j.configurationFile", "log4j2.xml");

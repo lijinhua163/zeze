@@ -30,6 +30,7 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 		this.logTypeId = logTypeId;
 	}
 
+	@SuppressWarnings("unchecked")
 	public V getOrAdd(K key) throws Throwable {
 		var exist = get(key);
 		if (null == exist) {
@@ -59,11 +60,9 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 					getParent().getObjectId() + getVariableId(), this::CreateLogBean);
 			return mapLog.Put(key, value);
 		}
-		else {
-			var oldV = _map.get(key);
-			_map = _map.plus(key, value);
-			return oldV;
-		}
+		var oldV = _map.get(key);
+		_map = _map.plus(key, value);
+		return oldV;
 	}
 
 	@Override
@@ -77,9 +76,9 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 			}
 		}
 
-		if (this.isManaged()) {
-			for (var p : m.entrySet()) {
-				p.getValue().InitRootInfo(RootInfo, this);
+		if (isManaged()) {
+			for (var v : m.values()) {
+				v.InitRootInfo(RootInfo, this);
 			}
 			var txn = Transaction.getCurrent();
 			assert txn != null;
@@ -104,12 +103,11 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 			var mapLog = (LogMap2<K, V>)txn.LogGetOrAdd(
 					getParent().getObjectId() + getVariableId(), this::CreateLogBean);
 			return mapLog.Remove((K)key);
-		} else {
-			//noinspection SuspiciousMethodCalls
-			var exist = _map.get(key);
-			_map = _map.minus(key);
-			return exist;
 		}
+		//noinspection SuspiciousMethodCalls
+		var exist = _map.get(key);
+		_map = _map.minus(key);
+		return exist;
 	}
 
 	@Override
@@ -122,15 +120,14 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 			var mapLog = (LogMap1<K, V>)txn.LogGetOrAdd(
 					getParent().getObjectId() + getVariableId(), this::CreateLogBean);
 			return mapLog.Remove(item.getKey(), item.getValue());
-		} else {
-			var old = _map;
-			var exist = old.get(item.getKey());
-			if (null != exist && exist.equals(item.getValue())) {
-				_map = _map.minus(item.getKey());
-				return true;
-			}
-			return false;
 		}
+		var old = _map;
+		var exist = old.get(item.getKey());
+		if (null != exist && exist.equals(item.getValue())) {
+			_map = _map.minus(item.getKey());
+			return true;
+		}
+		return false;
 	}
 
 	@Override
@@ -154,8 +151,8 @@ public class PMap2<K, V extends Bean> extends PMap<K, V> {
 		@SuppressWarnings("unchecked")
 		var log = (LogMap2<K, V>)_log;
 		var tmp = _map;
-		for (var put : log.getReplaced().entrySet())
-			put.getValue().InitRootInfo(RootInfo, this);
+		for (var put : log.getReplaced().values())
+			put.InitRootInfo(RootInfo, this);
 		tmp = tmp.plusAll(log.getReplaced()).minusAll(log.getRemoved());
 
 		// apply changed

@@ -2,6 +2,8 @@ package Zeze.Net;
 
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import Zeze.Util.TaskCompletionSource;
 import org.w3c.dom.Element;
 
@@ -27,6 +29,7 @@ public class Connector {
 	private Future<?> ReconnectTask;
 	private int MaxReconnectDelay = 8000; // 毫秒
 	private int ReConnectDelay;
+	private static final int ReadyTimeout = 5000;
 
 	public static Connector Create(Element e) {
 		String className = e.getAttribute("Class");
@@ -93,6 +96,16 @@ public class Connector {
 
 	public final void setAutoReconnect(boolean value) {
 		IsAutoReconnect = value;
+		if (IsAutoReconnect) {
+			TryReconnect();
+		} else {
+			synchronized (this) {
+				if (ReconnectTask != null) {
+					ReconnectTask.cancel(false);
+					ReconnectTask = null;
+				}
+			}
+		}
 	}
 
 	public final boolean isConnected() {
@@ -116,8 +129,8 @@ public class Connector {
 
 	public final AsyncSocket GetReadySocket() {
 		try {
-			return FutureSocket.get();
-		} catch (InterruptedException | ExecutionException e) {
+			return FutureSocket.get(ReadyTimeout, TimeUnit.MILLISECONDS);
+		} catch (InterruptedException | ExecutionException | TimeoutException e) {
 			throw new RuntimeException(e);
 		}
 	}

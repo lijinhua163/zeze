@@ -89,7 +89,14 @@ public final class Changes extends Zeze.Raft.Log {
 		}
 
 		public void SetTableByName(Changes changes, String templateName) {
-			Table = changes.rocks.GetTableTemplate(templateName).OpenTable(TableTemplateId);
+			var tableTpl = changes.rocks.GetTableTemplate(templateName);
+			if (tableTpl == null) {
+				var names = new StringBuilder();
+				for (String name : changes.rocks.getTableTemplates().keySet())
+					names.append(' ').append(name);
+				throw new NullPointerException("unknown table template: " + templateName + ", available:" + names);
+			}
+			Table = tableTpl.OpenTable(TableTemplateId);
 		}
 
 		public void Collect(Transaction.RecordAccessed ar) {
@@ -194,10 +201,11 @@ public final class Changes extends Zeze.Raft.Log {
 	@Override
 	public void Apply(RaftLog holder, StateMachine stateMachine) {
 		if (holder.getLeaderFuture() != null) {
-			Rocks.logger.debug(String.format("%s LeaderApply", rocks.getRaft().getName()));
+			if (Rocks.isDebugEnabled)
+				Rocks.logger.debug("{} LeaderApply", rocks.getRaft().getName());
 			transaction.LeaderApply(this);
 		} else {
-			// Rocks.logger.debug(String.format("%s FollowerApply", rocks.getRaft().getName()));
+			// Rocks.logger.debug("{} FollowerApply", rocks.getRaft().getName());
 			rocks.FollowerApply(this);
 		}
 	}

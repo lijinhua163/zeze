@@ -55,6 +55,30 @@ namespace Zeze.Transaction
             TimerClean = Util.Scheduler.Schedule(CleanNow, Table.TableConf.CacheCleanPeriod);
         }
 
+        public async Task<long> WalkKeyAsync(Func<K, Task<bool>> callback)
+        {
+            long cw = 0;
+            foreach (var e in DataMap)
+            {
+                if (false == await callback(e.Key))
+                    return cw;
+                ++cw;
+            }
+            return cw;
+        }
+
+        public long WalkKey(Func<K, bool> callback)
+        {
+            long cw = 0;
+            foreach (var e in DataMap)
+            {
+                if (false == callback(e.Key))
+                    return cw;
+                ++cw;
+            }
+            return cw;
+        }
+
         public void Close()
         {
             TimerNewHot?.Cancel();
@@ -93,30 +117,27 @@ namespace Zeze.Transaction
 
         public Record<K, V> GetOrAdd(K key, Func<K, Record<K, V>> valueFactory)
         {
-            bool isNew = false;
-            Record<K, V> result = DataMap.GetOrAdd(key,
-                (k) =>
-                {
-                    var r = valueFactory(k);
-                    var volatiletmp = LruHot;
-                    volatiletmp[k] = r; // replace: add or update see this.Remove
-                    r.LruNode = volatiletmp;
-                    isNew = true;
-                    return r;
-                });
-
-            var volatiletmp = LruHot;
-            if (false == isNew && result.LruNode != volatiletmp)
+            var lruHot = LruHot;
+            var result = DataMap.GetOrAdd(key, k =>
             {
-                result.LruNode.TryRemove(KeyValuePair.Create(key, result));
-                if (volatiletmp.TryAdd(key, result))
+                var r = valueFactory(k);
+                lruHot[k] = r; // replace: add or update see this.Remove
+                r.LruNode = lruHot;
+                return r;
+            });
+
+            if (result.LruNode != lruHot)
+            {
+                // 旧纪录 && 优化热点执行调整
+                // 下面在发生LruHot变动+并发GetOrAdd时，哪个后执行，就调整到哪个node，不严格调整到真正的LruHot。
+                // 注意，这把锁仅用于这里，最好不要跟事务锁重合。
+                var oldNode = result.GetAndSetLruNodeNull();
+                if (oldNode != null)
                 {
-                    result.LruNode = volatiletmp;
+                    oldNode.TryRemove(key, out _);
+                    if (lruHot.TryAdd(key, result))
+                        result.LruNode = lruHot;
                 }
-                // else maybe fail in concurrent access.
-                // 并发访问导致重复的TryAdd，这里先这样写吧。可能会快点。
-                // volatiletmp[key] = result;
-                // result.LruNode = volatiletmp;
             }
             return result;
         }
@@ -142,7 +163,37 @@ namespace Zeze.Transaction
         }
         */
 
-        public void CleanNow(Zeze.Util.SchedulerTask ThisTask)
+        private void TryPollLruQueue()
+        {
+            var cap = LruQueue.Count - 8640;
+            if (cap <= 0)
+                return;
+
+            var polls = new List<ConcurrentDictionary<K, Record<K, V>>>(cap);
+            while (LruQueue.Count > 8640)
+            {
+                // 大概，删除超过一天的节点。
+                if (false == LruQueue.TryDequeue(out var node))
+                    break;
+                polls.Add(node);
+            }
+
+            // 把被删除掉的node里面的记录迁移到当前最老(head)的node里面。
+            if (false == LruQueue.TryPeek(out var head))
+                throw new Exception("Impossible!");
+            foreach (var poll in polls)
+            {
+                foreach (var e in poll)
+                {
+                    // concurrent see GetOrAdd
+                    var r = e.Value;
+                    if (r.CompareAndSetLruNodeNull(poll) && head.TryAdd(e.Key, r)) // 并发访问导致这个记录已经被迁移走。
+                        r.LruNode = head;                    
+                }
+            }
+        }
+
+        private void CleanNow(Zeze.Util.SchedulerTask ThisTask)
         {
             // 这个任务的执行时间可能很长，
             // 不直接使用 Scheduler 的定时任务，
@@ -151,6 +202,7 @@ namespace Zeze.Transaction
             if (Table.TableConf.CacheCapacity <= 0)
             {
                 TimerClean = Util.Scheduler.Schedule(CleanNow, Table.TableConf.CacheCleanPeriod);
+                TryPollLruQueue();
                 return; // 容量不限
             }
             try
@@ -178,9 +230,10 @@ namespace Zeze.Transaction
                     else
                     {
                         logger.Warn($"remain record when clean oldest lrunode.");
+                        System.Threading.Thread.Sleep(Table.TableConf.CacheCleanPeriodWhenExceedCapacity);
                     }
-                    System.Threading.Thread.Sleep(Table.TableConf.CacheCleanPeriodWhenExceedCapacity);
                 }
+                TryPollLruQueue();
             }
             finally
             {
@@ -198,13 +251,13 @@ namespace Zeze.Transaction
                 // see GetOrAdd
                 p.Value.State = GlobalCacheManagerServer.StateRemoved;
                 // 必须使用 Pair，有可能 LurNode 里面已经有新建的记录了。
-                p.Value.LruNode.TryRemove(p);
+                p.Value.LruNode?.TryRemove(p);
                 return true;
             }
             return false;
         }
 
-        private bool TryRemoveRecordUnderLocks(KeyValuePair<K, Record<K, V>> p)
+        private bool TryRemoveRecordUnderLock(KeyValuePair<K, Record<K, V>> p)
         {
             var storage = Table.TStorage;
             if (null == storage)
@@ -229,14 +282,23 @@ namespace Zeze.Transaction
             if (p.Value.Dirty)
                 return false;
 
+            if (p.Value.IsFreshAcquire())
+                return false;
+
             if (p.Value.State != GlobalCacheManagerServer.StateInvalid)
             {
-                var task = p.Value.Acquire(GlobalCacheManagerServer.StateInvalid);
-                task.Wait();
-                var (ResultCode, ResultState, _) = task.Result;
-                if (ResultCode != 0 || ResultState != GlobalCacheManagerServer.StateInvalid)
+                try
                 {
-                    return false;
+                    var task = p.Value.Acquire(GlobalCacheManagerServer.StateInvalid, false);
+                    task.Wait();
+                    var (ResultCode, ResultState) = task.Result;
+                    if (ResultCode != 0 || ResultState != GlobalCacheManagerServer.StateInvalid)
+                        return false;
+                }
+                catch (Exception e)
+                {
+                    logger.Error(e, "Acquire exception:");
+                    // 此时GlobalServer可能已经改成StateInvalid了, 无论如何还是当成已经Invalid保证安全
                 }
             }
             return Remove(p);
@@ -268,7 +330,7 @@ namespace Zeze.Transaction
                         if (rrs.RecordSet != null && rrs.RecordSet.Count > 1)
                             return false; // 只包含自己的时候才可以删除，多个记录关联起来时不删除。
 
-                        return TryRemoveRecordUnderLocks(p);
+                        return TryRemoveRecordUnderLock(p);
                     }
                     finally
                     {

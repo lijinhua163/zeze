@@ -39,7 +39,7 @@ public class ModuleRank extends AbstractModule {
 	/**
 	 * 根据 value 设置到排行榜中
 	 */
-	@RedirectHash
+	@RedirectHash(ConcurrentLevelSource="GetConcurrentLevel(arg1.getRankType())")
 	protected void UpdateRank(int hash, BConcurrentKey keyHint, long roleId, long value, Binary valueEx) {
 		int concurrentLevel = GetConcurrentLevel(keyHint.getRankType());
 		int maxCount = GetRankComputeCount(keyHint.getRankType());
@@ -364,7 +364,7 @@ public class ModuleRank extends AbstractModule {
 		var result = new SGetRankList();
 		if (session.getRoleId() == null) {
 			result.setResultCode(-1);
-			session.sendResponse(result);
+			session.sendResponseWhileCommit(result);
 			return Procedure.LogicError;
 		}
 		/*
@@ -372,13 +372,13 @@ public class ModuleRank extends AbstractModule {
 		GetRankAsync(protocol.Argument.RankType, (rank) =>
 		{
 		    result.Argument.RankList.AddRange(rank.TableValue.RankList);
-		    session.SendResponse(result);
+		    session.sendResponseWhileCommit(result);
 		});
 		/*/
 		// 同步方式获取rank
 		var rankKey = NewRankKey(protocol.Argument.getRankType(), protocol.Argument.getTimeType());
 		result.Argument.getRankList().addAll(GetRankSync(rankKey).getTableValue().getRankList());
-		session.sendResponse(result);
+		session.sendResponseWhileCommit(result);
 		// */
 		return Procedure.Success;
 	}
@@ -452,7 +452,7 @@ public class ModuleRank extends AbstractModule {
 		public int serverId;
 	}
 
-	@RedirectToServer // 单发给某个serverId执行,可以是本服. 返回类型可以是void或RedirectFuture<自定义结果类型或Long(resultCode)>
+	@RedirectToServer // 单发给某个serverId执行(找不到或没连接会抛异常),可以是本服. 返回类型可以是void或RedirectFuture<自定义结果类型或Long(resultCode)>
 	public RedirectFuture<TestToServerResult> TestToServer(int serverId, int in) { // 首个参数serverId是固定必要的特殊参数,后面是自定义输入参数
 		TestToServerResult result = new TestToServerResult();
 		result.out = in;
@@ -473,14 +473,14 @@ public class ModuleRank extends AbstractModule {
 		public String _string = "";
 		public byte[] _bytes = ByteBuffer.Empty;
 		public Binary _binary = Binary.Empty;
-		public EmptyBean bean = new EmptyBean(); // 使用Bean自己的序列化,需要序列化的引用类型成员在构造后不能为null
+		public final EmptyBean bean = new EmptyBean(); // 使用Bean自己的序列化,需要序列化的引用类型成员在构造后不能为null
 		public Date date = new Date(); // 使用JDK自带的序列化
 		public transient String str; // 不会序列化transient
 		protected Object obj; // 不会序列化非public
 	}
 
 	// 第一个参数hash是固定的特殊参数
-	@RedirectHash // 单发给某个hash值指定的server执行,可以是本服. 返回类型同ToServer
+	@RedirectHash // 单发给某个hash值指定的server执行,可能是本服,找不到hash节点也会在本服执行. 返回类型同ToServer
 	public RedirectFuture<TestHashResult> TestHash(int hash, int in) { // 首个参数hash是固定必要的特殊参数,后面是自定义输入参数
 		var f = new RedirectFuture<TestHashResult>();
 		Task.run(App.Zeze.NewProcedure(() -> {
@@ -522,7 +522,7 @@ public class ModuleRank extends AbstractModule {
 			throw new Exception("not bug, only for test");
 		case 4: // local async
 		case 5: // remote async
-			var future = RedirectAllFuture.<TestToAllResult>async(); // 启用异步方式,之后在result.send()时回复结果,如果不调用async()则默认在方法返回时自动同步回复结果
+			var future = RedirectAllFuture.<TestToAllResult>async(); // 启用异步方式,之后在future.asyncResult()时回复结果
 			Task.run(App.Zeze.NewProcedure(() -> {
 				future.asyncResult(new TestToAllResult(in));
 				return Procedure.Success;

@@ -27,6 +27,7 @@ namespace Zeze.Services
         public const int StateReduceNetError = 13;  // 用来表示 reduce 网络失败。不是状态。
         public const int StateReduceDuplicate = 14; // 用来表示重复的 reduce。错误报告，不是状态。
         public const int StateReduceSessionNotFound = 15;
+        public const int StateReduceErrorFreshAcquire = 16; // 错误码，too many try 处理机制
 
         public const int AcquireShareDeadLockFound = 21;
         public const int AcquireShareAlreadyIsModify = 22;
@@ -38,6 +39,7 @@ namespace Zeze.Services
         public const int AcquireException = 28;
         public const int AcquireInvalidFailed = 29;
         public const int AcquireNotLogin = 30;
+        public const int AcquireFreshSource = 31;
 
         public const int ReduceErrorState = 41;
         public const int ReduceShareAlreadyIsInvalid = 42;
@@ -86,6 +88,10 @@ namespace Zeze.Services
             // 尽量不重新调整ConcurrentDictionary。
             public int InitialCapacity { get; set; } = 10000000;
 
+            public int MaxNetPing = 1500;
+            public int ServerProcessTime = 1000;
+            public int ServerReleaseTimeout = 10 * 1000;
+
             public void Parse(XmlElement self)
             {
                 string attr;
@@ -101,6 +107,16 @@ namespace Zeze.Services
                     InitialCapacity = int.Parse(attr);
                 if (InitialCapacity < 31)
                     InitialCapacity = 31;
+
+                attr = self.GetAttribute("MaxNetPing");
+                if (attr.Length > 0)
+                    MaxNetPing = int.Parse(attr);
+                attr = self.GetAttribute("ServerProcessTime");
+                if (attr.Length > 0)
+                    ServerProcessTime = int.Parse(attr);
+                attr = self.GetAttribute("ServerReleaseTimeout");
+                if (attr.Length > 0)
+                    ServerReleaseTimeout = int.Parse(attr);
             }
         }
 
@@ -179,9 +195,62 @@ namespace Zeze.Services
                         Handle = ProcessCleanup,
                     });
 
+                Server.AddFactoryHandle(
+                    new KeepAlive().TypeId,
+                    new Service.ProtocolFactoryHandle()
+                    {
+                        Factory = () => new KeepAlive(),
+                        Handle = ProcessKeepAlive
+                    });
                 ServerSocket = Server.NewServerSocket(ipaddress, port, null);
 
+
+                // Global的守护不需要独立线程。当出现异常问题不能工作时，没有释放锁是不会造成致命问题的。
+                AchillesHeelConfig = new AchillesHeelConfig(Config.MaxNetPing, Config.ServerProcessTime, Config.ServerReleaseTimeout);
+                Scheduler.Schedule(AchillesHeelDaemon, 5000, 5000);
             }
+        }
+
+        private AchillesHeelConfig AchillesHeelConfig;
+
+        private async Task AchillesHeelDaemon(SchedulerTask ThisTask)
+        {
+            var now = Util.Time.NowUnixMillis;
+
+            foreach (var session in Sessions.Values)
+            { 
+                if (now - session.GetActiveTime() > AchillesHeelConfig.GlobalDaemonTimeout)
+                {
+                    using (await session.Mutex.LockAsync())
+                    {
+                        session.Kick();
+                        if (session.Acquired.Count > 0)
+                        {
+                            logger.Info($"AchillesHeelDaemon.Release begin {session}");
+                            foreach (var e in session.Acquired)
+                            {
+                                // ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
+                                await ReleaseAsync(session, e.Key, false);
+                            }
+                            session.SetActiveTime(Util.Time.NowUnixMillis);
+                            logger.Info($"AchillesHeelDaemon.Release end {session}");
+                        }
+                    }
+                }
+            }
+        }
+
+        private Task<long> ProcessKeepAlive(Protocol p)
+        {
+            var session = (CacheHolder)p.UserState;
+            if (null == session)
+            {
+                p.SendResultCode(AcquireNotLogin);
+                return Task.FromResult(0L);
+            }
+            session.SetActiveTime(Util.Time.NowUnixMillis);
+            p.SendResultCode(0);
+            return Task.FromResult(0L);
         }
 
         public void Stop()
@@ -205,6 +274,9 @@ namespace Zeze.Services
         /// <returns></returns>
         private async Task<long> ProcessCleanup(Protocol p)
         {
+            if (AchillesHeelConfig != null)
+                return 0;
+
             var rpc = p as Cleanup;
 
             // 安全性以后加强。
@@ -246,12 +318,12 @@ namespace Zeze.Services
             var rpc = p as Login;
             var session = Sessions.GetOrAdd(rpc.Argument.ServerId, (_) => new CacheHolder(Config));
 
-            if (false == await session.TryBindSocket(p.Sender, rpc.Argument.GlobalCacheManagerHashIndex))
+            if (false == await session.TryBindSocket(p.Sender, rpc.Argument.GlobalCacheManagerHashIndex, true))
             {
                 rpc.SendResultCode(LoginBindSocketFail);
                 return 0;
             }
-
+            session.SetActiveTime(Util.Time.NowUnixMillis);
             // 只会有一个会话成功绑定并继续到达这里。
             // new login, 比如逻辑服务器重启。release old acquired.
             foreach (var e in session.Acquired)
@@ -259,6 +331,9 @@ namespace Zeze.Services
                 // ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
                 await ReleaseAsync(session, e.Key, false);
             }
+            rpc.Result.MaxNetPing = Config.MaxNetPing;
+            rpc.Result.ServerProcessTime = Config.ServerProcessTime;
+            rpc.Result.ServerReleaseTimeout = Config.ServerReleaseTimeout;
             rpc.SendResultCode(0);
             return 0;
         }
@@ -267,11 +342,12 @@ namespace Zeze.Services
         {
             var rpc = p as ReLogin;
             var session = Sessions.GetOrAdd(rpc.Argument.ServerId, (_) => new CacheHolder(Config));
-            if (false == await session.TryBindSocket(p.Sender, rpc.Argument.GlobalCacheManagerHashIndex))
+            if (false == await session.TryBindSocket(p.Sender, rpc.Argument.GlobalCacheManagerHashIndex, false))
             {
                 rpc.SendResultCode(ReLoginBindSocketFail);
                 return 0;
             }
+            session.SetActiveTime(Util.Time.NowUnixMillis);
             rpc.SendResultCode(0);
             return 0;
         }
@@ -318,11 +394,13 @@ namespace Zeze.Services
             }
             try
             {
+                var session = rpc.Sender.UserState as CacheHolder;
+                session.SetActiveTime(Util.Time.NowUnixMillis);
                 switch (rpc.Argument.State)
                 {
                     case StateInvalid: // realease
-                        rpc.Result.State = await ReleaseAsync(rpc.Sender.UserState as CacheHolder, rpc.Argument.GlobalKey, true);
-                        rpc.SendResult();
+                        rpc.Result.State = await ReleaseAsync(session, rpc.Argument.GlobalKey, true);
+                        rpc.SendResultCode(0);
                         return 0;
 
                     case StateShare:
@@ -432,7 +510,6 @@ namespace Zeze.Services
                             {
                                 logger.Debug("1 {0} {1} {2}", sender, rpc.Argument.State, cs);
                                 rpc.Result.State = StateInvalid;
-                                rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                                 rpc.SendResultCode(AcquireShareDeadLockFound);
                                 return 0;
                             }
@@ -442,7 +519,6 @@ namespace Zeze.Services
                             {
                                 logger.Debug("2 {0} {1} {2}", sender, rpc.Argument.State, cs);
                                 rpc.Result.State = StateInvalid;
-                                rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                                 rpc.SendResultCode(AcquireShareDeadLockFound);
                                 return 0;
                             }
@@ -459,7 +535,7 @@ namespace Zeze.Services
                     continue; // concurrent release.
 
                 cs.AcquireStatePending = StateShare;
-                cs.GlobalSerialId = SerialIdGenerator.IncrementAndGet();
+                SerialIdGenerator.IncrementAndGet();
 
                 if (cs.Modify != null)
                 {
@@ -471,13 +547,12 @@ namespace Zeze.Services
                         // 已经是Modify又申请，可能是sender异常关闭，
                         // 又重启连上。更新一下。应该是不需要的。
                         sender.Acquired[gkey] = StateModify;
-                        rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                         rpc.SendResultCode(AcquireShareAlreadyIsModify);
                         return 0;
                     }
 
                     int reduceResultState = StateReduceNetError; // 默认网络错误。
-                    if (cs.Modify.Reduce(gkey, StateInvalid, cs.GlobalSerialId,
+                    if (cs.Modify.Reduce(gkey, StateInvalid, rpc.ResultCode,
                         async (p) =>
                         {
                             var r = p as Reduce;
@@ -505,6 +580,15 @@ namespace Zeze.Services
                             cs.Modify.Acquired.TryRemove(gkey, out _);
                             break;
 
+                        case StateReduceErrorFreshAcquire:
+                            cs.AcquireStatePending = StateInvalid;
+
+                            logger.Error("XXX fresh {0} {1} {2}", sender, rpc.Argument.State, cs);
+                            rpc.Result.State = StateInvalid;
+                            cs.Monitor.PulseAll();
+                            rpc.SendResultCode(StateReduceErrorFreshAcquire);
+                            return 0;
+
                         default:
                             // 包含协议返回错误的值的情况。
                             // case StateReduceRpcTimeout:
@@ -515,7 +599,6 @@ namespace Zeze.Services
 
                             logger.Error("XXX 8 {0} {1} {2}", sender, rpc.Argument.State, cs);
                             rpc.Result.State = StateInvalid;
-                            rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                             rpc.SendResultCode(AcquireShareFailed);
                             return 0;
                     }
@@ -526,8 +609,7 @@ namespace Zeze.Services
                     cs.AcquireStatePending = StateInvalid;
                     cs.Monitor.PulseAll();
                     logger.Debug("6 {0} {1} {2}", sender, rpc.Argument.State, cs);
-                    rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-                    rpc.SendResult();
+                    rpc.SendResultCode(0);
                     return 0;
                 }
 
@@ -536,8 +618,7 @@ namespace Zeze.Services
                 cs.AcquireStatePending = StateInvalid;
                 cs.Monitor.PulseAll();
                 logger.Debug("7 {0} {1} {2}", sender, rpc.Argument.State, cs);
-                rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-                rpc.SendResult();
+                rpc.SendResultCode(0);
 
                 return 0;
             }
@@ -572,7 +653,6 @@ namespace Zeze.Services
                             {
                                 logger.Debug("1 {0} {1} {2}", sender, rpc.Argument.State, cs);
                                 rpc.Result.State = StateInvalid;
-                                rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                                 rpc.SendResultCode(AcquireModifyDeadLockFound);
                                 return 0;
                             }
@@ -582,7 +662,6 @@ namespace Zeze.Services
                             {
                                 logger.Debug("2 {0} {1} {2}", sender, rpc.Argument.State, cs);
                                 rpc.Result.State = StateInvalid;
-                                rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                                 rpc.SendResultCode(AcquireModifyDeadLockFound);
                                 return 0;
                             }
@@ -600,7 +679,7 @@ namespace Zeze.Services
                     continue; // concurrent release
 
                 cs.AcquireStatePending = StateModify;
-                cs.GlobalSerialId = SerialIdGenerator.IncrementAndGet();
+                SerialIdGenerator.IncrementAndGet();
 
                 if (cs.Modify != null)
                 {
@@ -610,7 +689,6 @@ namespace Zeze.Services
                         // 已经是Modify又申请，可能是sender异常关闭，又重启连上。
                         // 更新一下。应该是不需要的。
                         sender.Acquired[gkey] = StateModify;
-                        rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                         rpc.SendResultCode(AcquireModifyAlreadyIsModify);
                         cs.AcquireStatePending = StateInvalid;
                         cs.Monitor.PulseAll();
@@ -618,7 +696,7 @@ namespace Zeze.Services
                     }
 
                     int reduceResultState = StateReduceNetError; // 默认网络错误。
-                    if (cs.Modify.Reduce(gkey, StateInvalid, cs.GlobalSerialId,
+                    if (cs.Modify.Reduce(gkey, StateInvalid, rpc.ResultCode,
                         async (p) =>
                         {
                             var r = p as Reduce;
@@ -640,6 +718,15 @@ namespace Zeze.Services
                             cs.Modify.Acquired.TryRemove(gkey, out _);
                             break; // reduce success
 
+                        case StateReduceErrorFreshAcquire:
+                            cs.AcquireStatePending = StateInvalid;
+
+                            logger.Error("XXX fresh {0} {1} {2}", sender, rpc.Argument.State, cs);
+                            rpc.Result.State = StateInvalid;
+                            cs.Monitor.PulseAll();
+                            rpc.SendResultCode(StateReduceErrorFreshAcquire);
+                            return 0;
+
                         default:
                             // case StateReduceRpcTimeout:
                             // case StateReduceException:
@@ -649,7 +736,6 @@ namespace Zeze.Services
 
                             logger.Error("XXX 9 {0} {1} {2}", sender, rpc.Argument.State, cs);
                             rpc.Result.State = StateInvalid;
-                            rpc.Result.GlobalSerialId = cs.GlobalSerialId;
                             rpc.SendResultCode(AcquireModifyFailed);
                             return 0;
                     }
@@ -661,8 +747,7 @@ namespace Zeze.Services
                     cs.Monitor.PulseAll();
 
                     logger.Debug("6 {0} {1} {2}", sender, rpc.Argument.State, cs);
-                    rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-                    rpc.SendResult();
+                    rpc.SendResultCode(0);
                     return 0;
                 }
 
@@ -679,7 +764,7 @@ namespace Zeze.Services
                         reduceSucceed.Add(sender);
                         continue;
                     }
-                    Reduce reduce = c.ReduceWaitLater(gkey, StateInvalid, cs.GlobalSerialId);
+                    Reduce reduce = c.ReduceWaitLater(gkey, StateInvalid, rpc.ResultCode);
                     if (null != reduce)
                     {
                         reducePending.Add(Util.KV.Create(c, reduce));
@@ -694,6 +779,7 @@ namespace Zeze.Services
                 // 两种情况不需要发reduce
                 // 1. share是空的, 可以直接升为Modify
                 // 2. sender是share, 而且reducePending的size是0
+                var freshReduce = false;
                 if (!(cs.Share.Count == 0) && (!senderIsShare || reducePending.Count > 0))
                 {
                     // 必须放到另外的线程执行，后面cs.Monitor.WaitAsync();会释放锁。
@@ -707,10 +793,18 @@ namespace Zeze.Services
                             try
                             {
                                 await reduce.Value.Future.Task;
-                                if (reduce.Value.Result.State == StateInvalid)
-                                    reduceSucceed.Add(reduce.Key);
-                                else
-                                    reduce.Key.SetError();
+                                switch (reduce.Value.Result.State)
+                                {
+                                    case StateInvalid:
+                                        reduceSucceed.Add(reduce.Key);
+                                        break;
+                                    case StateReduceErrorFreshAcquire:
+                                        freshReduce = true;
+                                        break;
+                                    default:
+                                        reduce.Key.SetError();
+                                        break;
+                                }
                                 Perf?.OnReduceEnd(reduce.Value);
                             }
                             catch (Exception ex)
@@ -749,8 +843,7 @@ namespace Zeze.Services
                     cs.Monitor.PulseAll();
 
                     logger.Debug("8 {0} {1} {2}", sender, rpc.Argument.State, cs);
-                    rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-                    rpc.SendResult();
+                    rpc.SendResultCode(0);
                 }
                 else
                 {
@@ -763,8 +856,7 @@ namespace Zeze.Services
                     cs.Monitor.PulseAll();
                     logger.Error("XXX 10 {0} {1} {2}", sender, rpc.Argument.State, cs);
                     rpc.Result.State = StateInvalid;
-                    rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-                    rpc.SendResultCode(AcquireModifyFailed);
+                    rpc.SendResultCode(freshReduce ? StateReduceErrorFreshAcquire : AcquireModifyFailed);
                 }
                 return 0;
             }
@@ -774,7 +866,6 @@ namespace Zeze.Services
         {
             internal CacheHolder Modify { get; set; }
             internal Binary GlobalKey { get; set; }
-            internal long GlobalSerialId { get; set; }
             internal HashSet<CacheHolder> Share { get; } = new HashSet<CacheHolder>();
             internal Nito.AsyncEx.AsyncMonitor Monitor { get; } = new Nito.AsyncEx.AsyncMonitor();
             internal int AcquireStatePending { get; set; } = StateInvalid;
@@ -799,22 +890,59 @@ namespace Zeze.Services
         public sealed class CacheHolder
         {
             private static readonly NLog.Logger logger = NLog.LogManager.GetCurrentClassLogger();
+            private long ActiveTime = Time.NowUnixMillis;
+            private bool Logined = false;
 
             public long SessionId { get; private set; }
 
             public ConcurrentDictionary<Binary, int> Acquired { get; }
-            private Nito.AsyncEx.AsyncLock Mutex { get; } = new Nito.AsyncEx.AsyncLock();
+            public Nito.AsyncEx.AsyncLock Mutex { get; } = new Nito.AsyncEx.AsyncLock();
             public int GlobalCacheManagerHashIndex { get; private set; } // UnBind 的时候不会重置，会一直保留到下一次Bind。
+
+            public long GetActiveTime()
+            {
+                return Interlocked.Read(ref ActiveTime);
+            }
+
+            public void SetActiveTime(long value)
+            {
+                Interlocked.Exchange(ref ActiveTime, value);
+            }
 
             public CacheHolder(GCMConfig config)
             {
                 Acquired = new(config.ConcurrencyLevel, config.InitialCapacity);
             }
 
-            public async Task<bool> TryBindSocket(AsyncSocket newSocket, int _GlobalCacheManagerHashIndex)
+            // not under lock
+            internal void Kick()
+            {
+                var peer = Instance.Server.GetSocket(SessionId);
+                if (null != peer)
+                {
+                    peer.UserState = null; // 来自这个Agent的所有请求都会失败。
+                    peer.Close(null); // 关闭连接，强制Agent重新登录。
+                }
+                SessionId = 0; // 清除网络状态。
+            }
+
+
+            public async Task<bool> TryBindSocket(AsyncSocket newSocket, int _GlobalCacheManagerHashIndex, bool login)
             {
                 using (await Mutex.LockAsync())
                 {
+                    if (login)
+                    {
+                        // login 相当于重置，允许再次Login。
+                        Logined = true;
+                    }
+                    else
+                    {
+                        // relogin 必须login之后才允许ReLogin。这个用来检测Global宕机并重启。
+                        if (false == Logined)
+                            return false;
+                    }
+
                     if (newSocket.UserState != null)
                         return false; // 不允许再次绑定。Login Or ReLogin 只能发一次。
 
@@ -827,7 +955,7 @@ namespace Zeze.Services
                         GlobalCacheManagerHashIndex = _GlobalCacheManagerHashIndex;
                         return true;
                     }
-                    // 每个AutoKeyLocalId只允许一个实例，已经存在了以后，旧的实例上有状态，阻止新的实例登录成功。
+                    // 每个ServerId只允许一个实例，已经存在了以后，旧的实例上有状态，阻止新的实例登录成功。
                     return false;
                 }
             }
@@ -853,21 +981,22 @@ namespace Zeze.Services
                 return "" + SessionId;
             }
 
-            public bool Reduce(Binary gkey, int state, long globalSerialId, Func<Protocol, Task<long>> response)
+            public bool Reduce(Binary gkey, int state, long fresh, Func<Protocol, Task<long>> response)
             {
                 try
                 {
                     lock (this)
                     {
-                        if (global::Zeze.Util.Time.NowUnixMillis - LastErrorTime < ForbidPeriod)
+                        if (global::Zeze.Util.Time.NowUnixMillis - LastErrorTime < Instance.AchillesHeelConfig.GlobalForbidPeriod)
                             return false;
                     }
                     AsyncSocket peer = GlobalCacheManagerServer.Instance.Server.GetSocket(SessionId);
                     if (null != peer)
                     {
-                        var reduce = new Reduce(gkey, state, globalSerialId);
+                        var reduce = new Reduce(gkey, state);
+                        reduce.ResultCode = fresh;
                         Instance.Perf?.OnReduceBegin(reduce);
-                        if (reduce.Send(peer, response, 10000))
+                        if (reduce.Send(peer, response, Instance.AchillesHeelConfig.ReduceTimeout))
                             return true;
                         Instance.Perf?.OnReduceCancel(reduce);
                     }
@@ -881,7 +1010,6 @@ namespace Zeze.Services
                 return false;
             }
 
-            public const long ForbidPeriod = 10 * 1000; // 10 seconds
             private long LastErrorTime = 0;
 
             public void SetError()
@@ -889,7 +1017,7 @@ namespace Zeze.Services
                 lock (this)
                 {
                     long now = global::Zeze.Util.Time.NowUnixMillis;
-                    if (now - LastErrorTime > ForbidPeriod)
+                    if (now - LastErrorTime > Instance.AchillesHeelConfig.GlobalForbidPeriod)
                         LastErrorTime = now;
                 }
             }
@@ -900,21 +1028,23 @@ namespace Zeze.Services
             /// <param name="gkey"></param>
             /// <param name="state"></param>
             /// <returns></returns>
-            public Reduce ReduceWaitLater(Binary gkey, int state, long globalSerialId)
+            public Reduce ReduceWaitLater(Binary gkey, int state, long fresh)
             {
                 try
                 {
                     lock (this)
                     {
-                        if (global::Zeze.Util.Time.NowUnixMillis - LastErrorTime < ForbidPeriod)
+                        if (global::Zeze.Util.Time.NowUnixMillis - LastErrorTime < Instance.AchillesHeelConfig.GlobalForbidPeriod)
                             return null;
                     }
                     AsyncSocket peer = GlobalCacheManagerServer.Instance.Server.GetSocket(SessionId);
                     if (null != peer)
                     {
-                        Reduce reduce = new(gkey, state, globalSerialId);
+                        Reduce reduce = new(gkey, state);
+                        reduce.ResultCode = fresh;
+
                         Instance.Perf?.OnReduceBegin(reduce);
-                        _ = reduce.SendAsync(peer, 10000);
+                        _ = reduce.SendAsync(peer, Instance.AchillesHeelConfig.ReduceTimeout);
                         return reduce;
                     }
                 }
@@ -932,7 +1062,7 @@ namespace Zeze.Services
 
 namespace Zeze.Services.GlobalCacheManager
 {
-    public sealed class Param : Bean
+    public sealed class GlobalKeyState : Bean
     {
         public Binary GlobalKey { get; set; }
         public int State { get; set; }
@@ -960,40 +1090,7 @@ namespace Zeze.Services.GlobalCacheManager
         }
     }
 
-    public sealed class Param2 : Bean
-    {
-        public Binary GlobalKey { get; set; }
-        public int State { get; set; }
-        public long GlobalSerialId { get; set; }
-
-        public override void Decode(ByteBuffer bb)
-        {
-            GlobalKey = bb.ReadBinary();
-            State = bb.ReadInt();
-
-            GlobalSerialId = bb.ReadLong();
-        }
-
-        public override void Encode(ByteBuffer bb)
-        {
-            bb.WriteBinary(GlobalKey);
-            bb.WriteInt(State);
-
-            bb.WriteLong(GlobalSerialId);
-        }
-
-        protected override void InitChildrenRootInfo(Record.RootInfo root)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override string ToString()
-        {
-            return GlobalKey + ":" + State;
-        }
-    }
-
-    public sealed class Acquire : Rpc<Param, Param2>
+    public sealed class Acquire : Rpc<GlobalKeyState, GlobalKeyState>
     {
         public readonly static int ProtocolId_ = Bean.Hash32(typeof(Acquire).FullName);
 
@@ -1011,7 +1108,7 @@ namespace Zeze.Services.GlobalCacheManager
         }
     }
 
-    public class Reduce : Rpc<Param2, Param2>
+    public class Reduce : Rpc<GlobalKeyState, GlobalKeyState>
     {
         public readonly static int ProtocolId_ = Bean.Hash32(typeof(Reduce).FullName);
 
@@ -1022,11 +1119,10 @@ namespace Zeze.Services.GlobalCacheManager
         {
         }
 
-        public Reduce(Binary gkey, int state, long globalSerialId)
+        public Reduce(Binary gkey, int state)
         {
             Argument.GlobalKey = gkey;
             Argument.State = state;
-            Argument.GlobalSerialId = globalSerialId;
         }
     }
 
@@ -1058,7 +1154,33 @@ namespace Zeze.Services.GlobalCacheManager
         }
     }
 
-    public sealed class Login : Rpc<LoginParam, EmptyBean>
+    public sealed class AchillesHeelConfigFromGlobal : Bean
+    {
+        public int MaxNetPing;
+        public int ServerProcessTime;
+        public int ServerReleaseTimeout;
+
+        public override void Decode(ByteBuffer bb)
+        {
+            MaxNetPing = bb.ReadInt();
+            ServerProcessTime = bb.ReadInt();
+            ServerReleaseTimeout = bb.ReadInt();
+        }
+
+        public override void Encode(ByteBuffer bb)
+        {
+            bb.WriteInt(MaxNetPing);
+            bb.WriteInt(ServerProcessTime);
+            bb.WriteInt(ServerReleaseTimeout);
+        }
+
+        protected override void InitChildrenRootInfo(Record.RootInfo root)
+        {
+            throw new NotImplementedException();
+        }
+    }
+
+    public sealed class Login : Rpc<LoginParam, AchillesHeelConfigFromGlobal>
     {
         public readonly static int ProtocolId_ = Bean.Hash32(typeof(Login).FullName);
 

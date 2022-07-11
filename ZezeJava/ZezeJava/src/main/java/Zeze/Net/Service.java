@@ -27,7 +27,7 @@ import org.apache.logging.log4j.Logger;
 
 public class Service {
 	protected static final Logger logger = LogManager.getLogger(Service.class);
-	private static final AtomicLong StaticSessionIdAtomicLong = new AtomicLong();
+	private static final AtomicLong StaticSessionIdAtomicLong = new AtomicLong(1);
 
 	private final String Name;
 	private final Application Zeze;
@@ -107,7 +107,7 @@ public class Service {
 
 	public final long NextSessionId() {
 		LongSupplier gen = SessionIdGenerator;
-		return gen != null ? gen.getAsLong() : StaticSessionIdAtomicLong.incrementAndGet();
+		return gen != null ? gen.getAsLong() : StaticSessionIdAtomicLong.getAndIncrement();
 	}
 
 	public final int getSocketCount() {
@@ -115,11 +115,6 @@ public class Service {
 	}
 
 	protected final LongConcurrentHashMap<AsyncSocket> getSocketMap() {
-		return SocketMap;
-	}
-
-	@Deprecated
-	public final LongConcurrentHashMap<AsyncSocket> getSocketMapInternal() {
 		return SocketMap;
 	}
 
@@ -230,7 +225,7 @@ public class Service {
 
 	@SuppressWarnings("RedundantThrows")
 	public void OnSocketAcceptError(AsyncSocket listener, Throwable e) throws Throwable {
-		logger.log(getSocketOptions().getSocketLogLevel(), "OnSocketAcceptError " + listener, e);
+		logger.error("OnSocketAcceptError: {}", listener, e);
 	}
 
 	/**
@@ -294,10 +289,10 @@ public class Service {
 			if (factoryHandle.Level != TransactionLevel.None) {
 				Zeze.getTaskOneByOneByKey().Execute(key, () ->
 						Task.Call(Zeze.NewProcedure(() -> factoryHandle.Handle.handle(p), p.getClass().getName(),
-								factoryHandle.Level, p.getUserState()), p, Protocol::SendResultCode));
+								factoryHandle.Level, p.getUserState()), p, Protocol::trySendResultCode));
 			} else {
 				Zeze.getTaskOneByOneByKey().Execute(key,
-						() -> Task.Call(() -> factoryHandle.Handle.handle(p), p, Protocol::SendResultCode));
+						() -> Task.Call(() -> factoryHandle.Handle.handle(p), p, Protocol::trySendResultCode));
 			}
 		} else
 			logger.warn("DispatchProtocol2: Protocol Handle Not Found: {}", p);
@@ -413,6 +408,7 @@ public class Service {
 	public abstract static class ManualContext {
 		private long SessionId;
 		private Object UserState;
+		private boolean IsTimeout;
 
 		public final long getSessionId() {
 			return SessionId;
@@ -433,16 +429,20 @@ public class Service {
 		public void OnRemoved() throws Throwable {
 		}
 
+		public boolean isTimeout() {
+			return IsTimeout;
+		}
+
+		void setIsTimeout(boolean value) {
+			IsTimeout = value;
+		}
+
 		private Service service;
 		public Service getService() {
 			return service;
 		}
 		public void setService(Service service) {
 			this.service = service;
-		}
-		// after OnRemoved if Timeout
-		@SuppressWarnings("RedundantThrows")
-		public void OnTimeout() throws Throwable {
 		}
 	}
 
@@ -456,11 +456,7 @@ public class Service {
 			if (ManualContexts.putIfAbsent(sessionId, context) == null) {
 				context.setSessionId(sessionId);
 				context.setService(this);
-				Task.schedule(timeout, () -> {
-					ManualContext ctx = TryRemoveManualContext(sessionId);
-					if (ctx != null)
-						ctx.OnTimeout();
-				});
+				Task.schedule(timeout, () -> TryRemoveManualContext(sessionId, true));
 				return sessionId;
 			}
 		}
@@ -472,10 +468,15 @@ public class Service {
 	}
 
 	public final <T extends ManualContext> T TryRemoveManualContext(long sessionId) {
+		return TryRemoveManualContext(sessionId, false);
+	}
+
+	private <T extends ManualContext> T TryRemoveManualContext(long sessionId, boolean isTimeout) {
 		@SuppressWarnings("unchecked")
 		var r = (T)ManualContexts.remove(sessionId);
 		if (r != null) {
 			try {
+				r.setIsTimeout(isTimeout);
 				r.OnRemoved();
 			} catch (Throwable skip) {
 				logger.error("ManualContext.OnRemoved", skip);

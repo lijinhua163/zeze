@@ -1,5 +1,6 @@
 package Zege.Message;
 
+import Zege.Program;
 import Zeze.Arch.ProviderUserSession;
 import Zeze.Transaction.Procedure;
 import Zeze.Transaction.TransactionLevel;
@@ -16,27 +17,31 @@ public class ModuleMessage extends AbstractModule {
     @TransactionLevelAnnotation(Level=TransactionLevel.None)
     protected long ProcessSendDepartmentMessageRequest(Zege.Message.SendDepartmentMessage r) {
         var session = ProviderUserSession.get(r);
-        var group = App.Zege_Friend.getDepartmentTree(r.Argument.getGroup());
+        var group = App.Zege_Friend.getGroup(r.Argument.getGroup());
 
         r.Argument.getMessage().setFrom(session.getAccount());
         r.Argument.getMessage().setGroup(r.Argument.getGroup());
+        r.Argument.getMessage().setDepartmentId(r.Argument.getDepartmentId());
 
         var notify = new NotifyMessage();
         notify.Argument = r.Argument.getMessage();
         if (0 == r.Argument.getDepartmentId()) {
             // group root
             group.getGroupMembers().walk((key, member) -> {
-                App.Provider.Online.sendWhileCommit(member.getAccount(), "PC", notify);
+                Program.counters.increment("GroupBroadcastMessage:" + r.Argument.getGroup() + "#" + r.Argument.getDepartmentId());
+                App.Provider.Online.sendAccountWhileCommit(member.getAccount(), notify, null);
                 return true;
             });
         } else {
             // department
             group.getDepartmentMembers(r.Argument.getDepartmentId()).walk((key, member) -> {
-                App.Provider.Online.sendWhileCommit(member.getAccount(), "PC", notify);
+                Program.counters.increment("GroupBroadcastMessage:" + r.Argument.getGroup() + "#" + r.Argument.getDepartmentId());
+                App.Provider.Online.sendAccountWhileCommit(member.getAccount(), notify, null);
                 return true;
             });
         }
         session.sendResponseWhileCommit(r);
+        Program.counters.increment("GroupMessage:" + r.Argument.getGroup() + "#" + r.Argument.getDepartmentId());
         return Procedure.Success;
     }
 
@@ -52,9 +57,10 @@ public class ModuleMessage extends AbstractModule {
         r.Argument.getMessage().setFrom(session.getAccount());
         var notify = new NotifyMessage();
         notify.Argument = r.Argument.getMessage();
-        App.Provider.Online.sendWhileCommit(r.Argument.getFriend(), "PC", notify);
+        App.Provider.Online.sendAccountWhileCommit(r.Argument.getFriend(), notify, null);
 
         session.sendResponseWhileCommit(r);
+        Program.counters.increment("FriendMessage");
         return Procedure.Success;
     }
 

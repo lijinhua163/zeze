@@ -9,9 +9,8 @@ public class ThreadFactoryWithName implements ThreadFactory {
 	private static final Method unstartedMethod;
 	// private static final AtomicInteger poolNumber = new AtomicInteger(1);
 
-	private final ThreadGroup group;
-	private final AtomicInteger threadNumber = new AtomicInteger(1);
-	private final String namePrefix;
+	protected final AtomicInteger threadNumber = new AtomicInteger(1);
+	protected final String namePrefix;
 
 	static {
 		Object ofVirtual0 = null;
@@ -19,7 +18,7 @@ public class ThreadFactoryWithName implements ThreadFactory {
 		try {
 			//noinspection JavaReflectionMemberAccess
 			ofVirtual0 = Thread.class.getMethod("ofVirtual", (Class<?>[])null).invoke(null);
-			unstartedMethod0 = Class.forName("java.lang.Thread.Builder").getMethod("unstarted", Runnable.class);
+			unstartedMethod0 = Class.forName("java.lang.Thread$Builder").getMethod("unstarted", Runnable.class);
 			Task.logger.info("ThreadFactoryWithName use virtual thread");
 		} catch (ReflectiveOperationException ignored) {
 		}
@@ -27,10 +26,12 @@ public class ThreadFactoryWithName implements ThreadFactory {
 		unstartedMethod = unstartedMethod0;
 	}
 
+	public static boolean isVirtualThreadEnabled() {
+		return unstartedMethod != null;
+	}
+
 	public ThreadFactoryWithName(String poolName) {
-		SecurityManager s = System.getSecurityManager();
-		group = (s != null) ? s.getThreadGroup() : Thread.currentThread().getThreadGroup();
-		namePrefix = poolName + "-thread-";
+		namePrefix = poolName + '-';
 	}
 
 	@Override
@@ -43,7 +44,7 @@ public class ThreadFactoryWithName implements ThreadFactory {
 				throw new RuntimeException(e);
 			}
 		} else {
-			t = new Thread(group, r, namePrefix + threadNumber.getAndIncrement(), 0);
+			t = new Thread(null, r, namePrefix + threadNumber.getAndIncrement(), 0);
 			//if (t.isDaemon())
 			//    t.setDaemon(false);
 			t.setDaemon(true); // 先不考虑安全关闭，以后再调整。

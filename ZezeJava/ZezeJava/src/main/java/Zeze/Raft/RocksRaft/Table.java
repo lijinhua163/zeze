@@ -6,13 +6,14 @@ import java.util.function.BiPredicate;
 import java.util.function.Function;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Serialize.SerializeHelper;
+import Zeze.Transaction.DatabaseRocksDb;
 import Zeze.Util.ConcurrentLruLike;
+import Zeze.Util.Func1;
 import Zeze.Util.Func2;
 import Zeze.Util.Reflect;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDBException;
 
 public final class Table<K, V extends Bean> {
@@ -48,7 +49,7 @@ public final class Table<K, V extends Bean> {
 
 	public void Open() {
 		ColumnFamily = Rocks.OpenFamily(Name);
-		LruCache = new ConcurrentLruLike<>(CacheCapacity, LruTryRemoveCallback, 200, 2000, 1024);
+		LruCache = new ConcurrentLruLike<>(Name, CacheCapacity, LruTryRemoveCallback, 200, 2000, 1024);
 	}
 
 	public Rocks getRocks() {
@@ -151,12 +152,14 @@ public final class Table<K, V extends Bean> {
 	private Record<K> GetOrLoad(K key, Bean putValue) {
 		TableKey tkey = new TableKey(Name, key);
 		while (true) {
-			Record<K> tempVar = new Record<>(keyEncodeFunc);
-			tempVar.setTable(this);
-			tempVar.setKey(key);
-			var r = LruCache.GetOrAdd(key, () -> tempVar);
-			//noinspection SynchronizationOnLocalVariableOrMethodParameter
-			synchronized (r) {
+			var r = LruCache.GetOrAdd(key, () -> {
+				var newR = new Record<>(keyEncodeFunc);
+				newR.setTable(this);
+				newR.setKey(key);
+				return newR;
+			});
+			r.mutex.lock();
+			try {
 				if (r.getRemoved())
 					continue;
 
@@ -176,6 +179,8 @@ public final class Table<K, V extends Bean> {
 				}
 				// else in cache
 				return r;
+			} finally {
+				r.mutex.unlock();
 			}
 		}
 	}
@@ -183,11 +188,12 @@ public final class Table<K, V extends Bean> {
 	private V StorageLoad(K key) {
 		var keyBB = ByteBuffer.Allocate();
 		keyEncodeFunc.accept(keyBB, key);
-		byte[] valueBytes = null;
+		byte[] valueBytes;
 		try {
-			valueBytes = Rocks.getStorage().get(ColumnFamily, new ReadOptions(), keyBB.Bytes, 0, keyBB.Size());
+			valueBytes = Rocks.getStorage().get(ColumnFamily, DatabaseRocksDb.getDefaultReadOptions(),
+					keyBB.Bytes, 0, keyBB.Size());
 		} catch (RocksDBException e) {
-			logger.error("RocksDB.get error! key=" + key, e);
+			throw new RuntimeException(e);
 		}
 		if (valueBytes == null)
 			return null;
@@ -260,6 +266,17 @@ public final class Table<K, V extends Bean> {
 		}
 	}
 
+	public boolean WalkKey(Func1<K, Boolean> callback) throws Throwable {
+		try (var it = Rocks.getStorage().newIterator(ColumnFamily)) {
+			for (it.seekToFirst(); it.isValid(); it.next()) {
+				var key = keyDecodeFunc.apply(ByteBuffer.Wrap(it.key()));
+				if (!callback.call(key))
+					return false;
+			}
+			return true;
+		}
+	}
+
 	public Record<K> FollowerApply(K key, Changes.Record rLog) {
 		Record<K> r;
 		switch (rLog.getState()) {
@@ -276,7 +293,7 @@ public final class Table<K, V extends Bean> {
 		case Changes.Record.Edit:
 			r = GetOrLoad(key);
 			if (r.getValue() == null) {
-				logger.fatal("editing bug record not exist.");
+				logger.fatal("editing bug record not exist. table={} key={}", Name, key, new Exception());
 				Rocks.getRaft().FatalKill();
 			}
 			for (var log : rLog.getLogBean())
@@ -284,7 +301,8 @@ public final class Table<K, V extends Bean> {
 			break;
 
 		default:
-			logger.fatal("unknown Changes.Record.State.");
+			logger.fatal("unknown Changes.Record.State. table={} key={} state={}",
+					Name, key, rLog.getState(), new Exception());
 			Rocks.getRaft().FatalKill();
 			return null;
 		}

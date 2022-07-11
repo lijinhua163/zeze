@@ -102,7 +102,8 @@ public final class Server extends HandshakeBoth {
 			Raft raft = ((Server)closed.getService()).getRaft();
 			raft.getImportantThreadPool().execute(() -> {
 				// avoid deadlock: lock(socket), lock (Raft).
-				synchronized (raft) {
+				raft.lock();
+				try {
 					if (getSocket() == closed) { // check is owner
 						try {
 							raft.getLogSequence().EndInstallSnapshot(this);
@@ -110,6 +111,8 @@ public final class Server extends HandshakeBoth {
 							logger.error("Server.ConnectorEx.OnSocketClose", ex);
 						}
 					}
+				} finally {
+					raft.unlock();
 				}
 			});
 			super.OnSocketClose(closed, e);
@@ -120,8 +123,11 @@ public final class Server extends HandshakeBoth {
 			super.OnSocketHandshakeDone(so);
 			Raft raft = ((Server)getService()).getRaft();
 			raft.getImportantThreadPool().execute(() -> Task.Call(() -> {
-				synchronized (raft) {
+				raft.lock();
+				try {
 					raft.getLogSequence().TrySendAppendEntries(this, null);
+				} finally {
+					raft.unlock();
 				}
 			}, "Start TrySendAppendEntries"));
 		}
@@ -189,15 +195,11 @@ public final class Server extends HandshakeBoth {
 			}
 			TrySendLeaderIs(p.getSender());
 			return 0L;
-		}, p, Protocol::SendResultCode);
+		}, p, Protocol::trySendResultCode);
 	}
 
 	@Override
 	public <P extends Protocol<?>> void DispatchProtocol(P p, ProtocolFactoryHandle<P> factoryHandle) {
-		// 防止Client不进入加密，直接发送用户协议。
-		if (!IsHandshakeProtocol(p.getTypeId()))
-			p.getSender().VerifySecurity();
-
 		if (IsImportantProtocol(p.getTypeId())) {
 			// 不能在默认线程中执行，使用专用线程池，保证这些协议得到处理。
 			// 内部协议总是使用明确返回值或者超时，不使用框架的错误时自动发送结果。
@@ -245,7 +247,8 @@ public final class Server extends HandshakeBoth {
 
 		// 没有判断是否和其他Raft-Node的连接。
 		Task.run(() -> {
-			synchronized (Raft) {
+			Raft.lock();
+			try {
 				if (Raft.isReadyLeader()) {
 					var r = new LeaderIs();
 					r.Argument.setTerm(Raft.getLogSequence().getTerm());
@@ -253,6 +256,8 @@ public final class Server extends HandshakeBoth {
 					r.Argument.setLeader(Raft.isLeader());
 					r.Send(so); // skip result
 				}
+			} finally {
+				Raft.unlock();
 			}
 		}, "Raft.LeaderIs.Me");
 	}

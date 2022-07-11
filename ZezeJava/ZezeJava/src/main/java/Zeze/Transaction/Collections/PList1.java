@@ -141,7 +141,7 @@ public class PList1<V> extends PList<V> {
 			}
 		}
 
-		if (this.isManaged()) {
+		if (isManaged()) {
 			var txn = Transaction.getCurrent();
 			assert txn != null;
 			txn.VerifyRecordAccessed(this);
@@ -150,16 +150,14 @@ public class PList1<V> extends PList<V> {
 					getParent().getObjectId() + getVariableId(), this::CreateLogBean);
 			return listLog.AddAll(items);
 		}
-		else {
-			_list = _list.plusAll(items);
-		}
+		_list = _list.plusAll(items);
 		return true;
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
 	public boolean removeAll(Collection<?> c) {
-		if (this.isManaged()) {
+		if (isManaged()) {
 			var txn = Transaction.getCurrent();
 			assert txn != null;
 			txn.VerifyRecordAccessed(this);
@@ -167,11 +165,9 @@ public class PList1<V> extends PList<V> {
 					getParent().getObjectId() + getVariableId(), this::CreateLogBean);
 			return listLog.RemoveAll((Collection<V>)c);
 		}
-		else {
-			var oldList = _list;
-			_list = _list.minusAll(c);
-			return oldList != _list;
-		}
+		var oldList = _list;
+		_list = _list.minusAll(c);
+		return oldList != _list;
 	}
 
 	@Override

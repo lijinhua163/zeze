@@ -1,50 +1,31 @@
 package Zeze.Transaction;
 
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
-import java.util.*;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.stream.Collectors;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 public final class Checkpoint {
 	private static final Logger logger = LogManager.getLogger(Checkpoint.class);
 
-	private final HashSet<Database> Databases = new HashSet<> ();
-	private HashSet<Database> getDatabases() {
-		return Databases;
-	}
-
+	private final ArrayList<Database> Databases = new ArrayList<>();
 	private final ReentrantReadWriteLock FlushReadWriteLock = new ReentrantReadWriteLock();
-
-	private volatile boolean IsRunning;
-	public boolean isRunning() {
-		return IsRunning;
-	}
-	private void setRunning(boolean value) {
-		IsRunning = value;
-	}
-	private int Period;
-	public int getPeriod() {
-		return Period;
-	}
-	private void setPeriod(int value) {
-		Period = value;
-	}
-
 	private final CheckpointMode Mode;
-	public CheckpointMode getCheckpointMode() {
-		return Mode;
-	}
-
 	private final Thread CheckpointThread;
 	private final Zeze.Application Zeze;
+	private final ReentrantLock lock = new ReentrantLock();
+	private final Condition cond = lock.newCondition();
+	private int Period;
+	private volatile boolean IsRunning;
+	private ArrayList<Runnable> actionCurrent;
+	private volatile ArrayList<Runnable> actionPending = new ArrayList<>();
 
-	public Zeze.Application getZeze() {
-		return Zeze;
-	}
 	public Checkpoint(Zeze.Application zeze, CheckpointMode mode, int serverId) {
 		this(zeze, mode, null, serverId);
 	}
@@ -54,9 +35,14 @@ public final class Checkpoint {
 		Mode = mode;
 		if (dbs != null)
 			Add(dbs);
-		CheckpointThread = new Thread(
-				() -> Task.Call(this::Run, "Checkpoint.Run"),
-				"CheckpointThread-" + serverId);
+		CheckpointThread = new Thread(() -> Task.Call(this::Run, "Checkpoint.Run"), "Checkpoint-" + serverId);
+		CheckpointThread.setDaemon(true);
+		CheckpointThread.setPriority(Thread.NORM_PRIORITY + 2);
+		CheckpointThread.setUncaughtExceptionHandler((__, e) -> logger.error("fatal exception", e));
+	}
+
+	public CheckpointMode getCheckpointMode() {
+		return Mode;
 	}
 
 	public void EnterFlushReadLock() {
@@ -73,25 +59,33 @@ public final class Checkpoint {
 
 	public Checkpoint Add(Iterable<Database> databases) {
 		for (var db : databases) {
-			this.getDatabases().add(db);
+			if (!Databases.contains(db))
+				Databases.add(db);
 		}
 		return this;
 	}
 
-	public synchronized void Start(int period) {
-		if (isRunning()) {
-			return;
-		}
+	public void Start(int period) {
+		lock.lock();
+		try {
+			if (IsRunning)
+				return;
 
-		setRunning(true);
-		setPeriod(period);
-		CheckpointThread.start();
+			IsRunning = true;
+			Period = period;
+			CheckpointThread.start();
+		} finally {
+			lock.unlock();
+		}
 	}
 
 	public void StopAndJoin() {
-		synchronized (this) {
-			setRunning(false);
-			this.notify();
+		lock.lock();
+		try {
+			IsRunning = false;
+			cond.signal();
+		} finally {
+			lock.unlock();
 		}
 		if (null != CheckpointThread) {
 			try {
@@ -104,46 +98,53 @@ public final class Checkpoint {
 
 	public void RunOnce() {
 		switch (getCheckpointMode()) {
-			case Immediately:
-				break;
+		case Immediately:
+			break;
 
-			case Period:
-				final TaskCompletionSource<Integer> source = new TaskCompletionSource<>();
-				AddActionAndPulse(() -> source.SetResult(0));
-				source.await();
-				break;
+		case Period:
+			final TaskCompletionSource<Integer> source = new TaskCompletionSource<>();
+			AddActionAndPulse(() -> source.SetResult(0));
+			source.await();
+			break;
 
-			case Table:
-				RelativeRecordSet.FlushWhenCheckpoint(this);
-				break;
+		case Table:
+			RelativeRecordSet.FlushWhenCheckpoint(this);
+			break;
 		}
 	}
 
 	private void Run() {
-		while (isRunning()) {
+		while (IsRunning) {
 			try {
 				switch (Mode) {
-					case Period:
-						CheckpointPeriod();
-						for (var action : actionCurrent) {
-							action.run();
+				case Period:
+					CheckpointPeriod();
+					for (var action : actionCurrent) {
+						action.run();
+					}
+					lock.lock();
+					try {
+						if (!actionPending.isEmpty()) {
+							continue; // 如果有未决的任务，马上开始下一次 DoCheckpoint。
 						}
-						synchronized (this) {
-							if (!actionPending.isEmpty()) {
-								continue; // 如果有未决的任务，马上开始下一次 DoCheckpoint。
-							}
-						}
-						break;
+					} finally {
+						lock.unlock();
+					}
+					break;
 
-					case Table:
-							RelativeRecordSet.FlushWhenCheckpoint(this);
-						break;
+				case Table:
+					RelativeRecordSet.FlushWhenCheckpoint(this);
+					break;
 
-					default:
-						break;
+				default:
+					break;
 				}
-				synchronized (this) {
-					this.wait(Period);
+				lock.lock();
+				try {
+					//noinspection ResultOfMethodCallIgnored
+					cond.await(Period, TimeUnit.MILLISECONDS);
+				} finally {
+					lock.unlock();
 				}
 			} catch (Throwable ex) {
 				logger.error("Run Exception", ex);
@@ -151,97 +152,83 @@ public final class Checkpoint {
 		}
 		logger.info("final checkpoint start.");
 		switch (Mode) {
-			case Period:
-				CheckpointPeriod();
-				break;
+		case Period:
+			CheckpointPeriod();
+			break;
 
-			case Table:
-				RelativeRecordSet.FlushWhenCheckpoint(this);
-				break;
-
-			default:
-				break;
+		case Table:
+			RelativeRecordSet.FlushWhenCheckpoint(this);
+			break;
 		}
 		logger.info("final checkpoint end.");
 	}
 
-	private ArrayList<Runnable> actionCurrent;
-	private volatile ArrayList<Runnable> actionPending = new ArrayList<>();
-
 	/**
-	 增加 checkpoint 完成一次以后执行的动作，每次 FlushReadWriteLock.EnterWriteLock()
-	 之前的动作在本次checkpoint完成时执行，之后的动作在下一次DoCheckpoint后执行。
-
-	 @param act
-	 action
-	*/
-	public void AddActionAndPulse(Runnable act) {
+	 * 增加 checkpoint 完成一次以后执行的动作，每次 FlushReadWriteLock.EnterWriteLock()
+	 * 之前的动作在本次checkpoint完成时执行，之后的动作在下一次DoCheckpoint后执行。
+	 */
+	public void AddActionAndPulse(Runnable action) {
 		final var r = FlushReadWriteLock.readLock();
 		r.lock();
 		try {
-			synchronized (this) {
-				actionPending.add(act);
-				notify();
+			lock.lock();
+			try {
+				actionPending.add(action);
+				cond.signal();
+			} finally {
+				lock.unlock();
 			}
-		}
-		finally {
+		} finally {
 			r.unlock();
 		}
 	}
 
 	private void CheckpointPeriod() {
 		// encodeN
-		for (var db : getDatabases()) {
+		for (var db : Databases)
 			db.EncodeN();
-		}
-		{
 		// snapshot
-			final var w = FlushReadWriteLock.writeLock();
-			w.lock();
-			try {
-				actionCurrent = actionPending;
-				actionPending = new ArrayList<>();
-				for (var db : getDatabases()) {
-					db.Snapshot();
-				}
-			}
-			finally {
-				w.unlock();
-			}
+		final var w = FlushReadWriteLock.writeLock();
+		w.lock();
+		try {
+			actionCurrent = actionPending;
+			actionPending = new ArrayList<>();
+			for (var db : Databases)
+				db.Snapshot();
+		} finally {
+			w.unlock();
 		}
 		// flush
-		var dts = new HashMap<Database, Database.Transaction>();
+		var n = Databases.size();
+		var dts = new Database.Transaction[n];
 		Database.Transaction localCacheTransaction = Zeze.getLocalRocksCacheDb().BeginTransaction();
 		try {
-			for (var db : getDatabases()) {
-				dts.put(db, db.BeginTransaction());
-			}
-			for (var e : dts.entrySet()) {
-				e.getKey().Flush(e.getValue(), localCacheTransaction);
-			}
-			for (var e : dts.entrySet()) {
-				e.getValue().Commit();
-			}
-			if (null != localCacheTransaction)
+			for (int i = 0; i < n; i++)
+				dts[i] = Databases.get(i).BeginTransaction();
+			for (int i = 0; i < n; i++)
+				Databases.get(i).Flush(dts[i], localCacheTransaction);
+			for (var v : dts)
+				v.Commit();
+			if (localCacheTransaction != null)
 				localCacheTransaction.Commit();
 			// cleanup
 			try {
-				for (var db : getDatabases()) {
+				for (var db : Databases)
 					db.Cleanup();
-				}
 			} catch (Throwable e) {
-				logger.error("CheckpointPeriod Cleanup Exception", e);
+				logger.fatal("CheckpointPeriod Cleanup Exception", e);
+				LogManager.shutdown();
 				Runtime.getRuntime().halt(54321);
 			}
 		} catch (Throwable e) {
-			for (var t : dts.values()) {
+			for (var t : dts) {
 				try {
 					t.Rollback();
 				} catch (Throwable ex) {
 					logger.error("CheckpointPeriod Rollback Exception", ex);
 				}
 			}
-			if (null != localCacheTransaction) {
+			if (localCacheTransaction != null) {
 				try {
 					localCacheTransaction.Rollback();
 				} catch (Throwable ex) {
@@ -250,32 +237,34 @@ public final class Checkpoint {
 			}
 			throw e;
 		} finally {
-			for (var t : dts.values()) {
+			for (var t : dts) {
 				try {
 					t.close();
 				} catch (Throwable ex) {
-					logger.error("CheckpointPeriod close Exception transaction=" + t, ex);
+					logger.error("CheckpointPeriod close Exception transaction={}", t, ex);
 				}
 			}
-			if (null != localCacheTransaction) {
+			if (localCacheTransaction != null) {
 				try {
 					localCacheTransaction.close();
 				} catch (Throwable ex) {
-					logger.error("CheckpointPeriod close Exception transaction=" + localCacheTransaction, ex);
+					logger.error("CheckpointPeriod close Exception transaction={}", localCacheTransaction, ex);
 				}
 			}
 		}
 	}
 
 	public void Flush(Transaction trans) {
-		var result = trans.getAccessedRecords().values()
-				.stream().filter((r) -> r.Dirty).map((r) -> r.Origin)
-				.collect(Collectors.toList());
-		Flush(result);
+		var records = new ArrayList<Record>(trans.getAccessedRecords().size());
+		for (var ar : trans.getAccessedRecords().values()) {
+			if (ar.Dirty)
+				records.add(ar.AtomicTupleRecord.Record);
+		}
+		Flush(records);
 	}
 
 	public void Flush(Iterable<Record> rs) {
-		var dts = new HashMap<Database, Database.Transaction>();
+		var dts = new IdentityHashMap<Database, Database.Transaction>();
 		Database.Transaction localCacheTransaction = Zeze.getLocalRocksCacheDb().BeginTransaction();
 
 		try {
@@ -283,12 +272,7 @@ public final class Checkpoint {
 			for (var r : rs) {
 				if (r.getTable().GetStorage() != null) {
 					var database = r.getTable().GetStorage().getDatabaseTable().getDatabase();
-					var t = dts.get(database);
-					if (null == t) {
-						t = database.BeginTransaction();
-						dts.put(database, t);
-					}
-					r.setDatabaseTransactionTmp(t);
+					r.setDatabaseTransactionTmp(dts.computeIfAbsent(database, Database::BeginTransaction));
 				}
 			}
 			// 编码
@@ -311,11 +295,11 @@ public final class Checkpoint {
 					r.Cleanup();
 				}
 			} catch (Throwable e) {
-				logger.error("Flush Cleanup Exception", e);
+				logger.fatal("Flush Cleanup Exception", e);
+				LogManager.shutdown();
 				Runtime.getRuntime().halt(54321);
 			}
-		}
-		catch (Throwable e) {
+		} catch (Throwable e) {
 			for (var t : dts.values()) {
 				try {
 					t.Rollback();
@@ -331,20 +315,19 @@ public final class Checkpoint {
 				}
 			}
 			throw e;
-		}
-		finally {
+		} finally {
 			for (var t : dts.values()) {
 				try {
 					t.close();
 				} catch (Throwable e) {
-					logger.error("Flush close Exception transaction=" + t, e);
+					logger.error("Flush close Exception transaction={}", t, e);
 				}
 			}
 			if (null != localCacheTransaction) {
 				try {
 					localCacheTransaction.close();
 				} catch (Throwable e) {
-					logger.error("Flush close Exception transaction=" + localCacheTransaction, e);
+					logger.error("Flush close Exception transaction={}", localCacheTransaction, e);
 				}
 			}
 		}

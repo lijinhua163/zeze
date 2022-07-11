@@ -1,5 +1,6 @@
 package Zege.Message;
 
+import Zege.Program;
 import Zeze.Net.Binary;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Transaction.EmptyBean;
@@ -13,22 +14,28 @@ public class ModuleMessage extends AbstractModule {
     public void Stop(Zege.App app) throws Throwable {
     }
 
-    public TaskCompletionSource<EmptyBean> send(String target, String message) {
+    public TaskCompletionSource<EmptyBean> send(String target, String message, long departmentId) {
         if (target.endsWith("@group")) {
             var req = new SendDepartmentMessage();
             req.Argument.setGroup(target);
-            var bMsg = new BTextMessage();
-            bMsg.setMessage(message);
-            req.Argument.getMessage().setSecureMessage(new Binary(ByteBuffer.Encode(bMsg)));
-            return req.SendForWait(App.Connector.GetReadySocket());
-        } else {
-            var req = new SendMessage();
-            req.Argument.setFriend(target);
-            var bMsg = new BTextMessage();
-            bMsg.setMessage(message);
-            req.Argument.getMessage().setSecureMessage(new Binary(ByteBuffer.Encode(bMsg)));
-            return req.SendForWait(App.Connector.GetReadySocket());
+            req.Argument.setDepartmentId(departmentId);
+            if (null != message) {
+                var bMsg = new BTextMessage();
+                bMsg.setMessage(message);
+                req.Argument.getMessage().setSecureMessage(new Binary(ByteBuffer.Encode(bMsg)));
+            }
+            Program.counters.increment("SendGroupMessage:" + req.Argument.getGroup() + "#" + req.Argument.getDepartmentId());
+            return req.SendForWait(App.Connector.TryGetReadySocket());
         }
+        var req = new SendMessage();
+        req.Argument.setFriend(target);
+        if (null != message) {
+            var bMsg = new BTextMessage();
+            bMsg.setMessage(message);
+            req.Argument.getMessage().setSecureMessage(new Binary(ByteBuffer.Encode(bMsg)));
+        }
+        Program.counters.increment("SendFriendMessage");
+        return req.SendForWait(App.Connector.TryGetReadySocket());
     }
 
     @Override

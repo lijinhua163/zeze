@@ -1,16 +1,40 @@
 package Zeze.Transaction;
 
 import java.util.ArrayList;
-import java.util.List;
 import Zeze.Util.LongHashMap;
 
 public final class Savepoint {
-	// private static final Logger logger = LogManager.getLogger(Savepoint.class);
-	private final LongHashMap<Log> Logs = new LongHashMap<>();
-	// private readonly Dictionary<long, Log> Newly = new Dictionary<>(); // 当前Savepoint新加的，用来实现Rollback，先不实现。
+	private LongHashMap<Log> Logs;
+	// private final LongHashMap<Log> Newly = new LongHashMap<>(); // 当前Savepoint新加的，用来实现Rollback，先不实现。
+	private ArrayList<Action> actions;
 
-	public LongHashMap<Log> getLogs() {
-		return Logs;
+	public LongHashMap<Log>.Iterator logIterator() {
+		var logs = Logs;
+		return logs != null ? logs.iterator() : null;
+	}
+
+	public Log GetLog(long logKey) {
+		var logs = Logs;
+		return logs != null ? logs.get(logKey) : null;
+	}
+
+	public void PutLog(Log log) {
+		var logs = Logs;
+		if (logs == null)
+			Logs = logs = new LongHashMap<>();
+		logs.put(log.getLogKey(), log);
+		// Newly.put(log.getLogKey(), log);
+	}
+
+	public Savepoint BeginSavepoint() {
+		var sp = new Savepoint();
+		var logs = Logs;
+		if (logs != null) {
+			var newLogs = new LongHashMap<>(logs);
+			newLogs.foreachUpdate((__, v) -> v.BeginSavepoint());
+			sp.Logs = newLogs;
+		}
+		return sp;
 	}
 
 	public enum ActionType {
@@ -19,7 +43,7 @@ public final class Savepoint {
 		NESTED_ROLLBACK
 	}
 
-	public static class Action {
+	public static final class Action {
 		public ActionType actionType;
 		public final Runnable action;
 
@@ -29,68 +53,66 @@ public final class Savepoint {
 		}
 	}
 
-	private final ArrayList<Action> actions = new ArrayList<>();
-
-	public void PutLog(Log log) {
-		Logs.put(log.getLogKey(), log);
-		//newly[log.LogKey] = log;
-	}
-
-	public Log GetLog(long logKey) {
-		return Logs.get(logKey);
-	}
-
-	public Savepoint Duplicate() {
-		Savepoint sp = new Savepoint();
-		Logs.foreachValue((log) -> sp.Logs.put(log.getLogKey(), log.BeginSavepoint()));
-		return sp;
-	}
-
-	public void MergeFrom(Savepoint other, boolean isCommit) {
-		if (isCommit) {
-			other.Logs.foreachValue((log) -> log.EndSavepoint(this));
-			actions.addAll(other.actions);
-		} else{
-
-			for (Action action : other.actions) {
-				if (action.actionType == ActionType.NESTED_ROLLBACK) {
-					actions.add(action);
-				} else if (action.actionType == ActionType.ROLLBACK){
-					action.actionType = ActionType.NESTED_ROLLBACK;
-					actions.add(action);
-				}
-			}
-		}
-	}
-
-	public void MergeActions(List<Action> transactionActions, boolean isCommit) {
-		for (Action action : actions) {
-			if (action.actionType == ActionType.NESTED_ROLLBACK) {
-				transactionActions.add(action);
-			} else if (action.actionType == ActionType.ROLLBACK && !isCommit ||
-					action.actionType == ActionType.COMMIT && isCommit){
-				transactionActions.add(action);
-			}
-		}
+	private ArrayList<Action> getActionsForAdd() {
+		var a = actions;
+		if (a == null)
+			actions = a = new ArrayList<>();
+		return a;
 	}
 
 	public void addCommitAction(Runnable action) {
-		this.actions.add(new Action(ActionType.COMMIT, action));
+		getActionsForAdd().add(new Action(ActionType.COMMIT, action));
 	}
 
 	public void addRollbackAction(Runnable action) {
-		this.actions.add(new Action(ActionType.ROLLBACK, action));
+		getActionsForAdd().add(new Action(ActionType.ROLLBACK, action));
 	}
 
-	@SuppressWarnings("unused")
-	private void clearActions() {
-		this.actions.clear();
+	public void MergeCommitFrom(Savepoint next) {
+		var nextLogs = next.Logs;
+		if (nextLogs != null)
+			nextLogs.foreachValue(log -> log.EndSavepoint(this));
+		var nextActions = next.actions;
+		if (nextActions != null)
+			getActionsForAdd().addAll(nextActions);
+	}
+
+	public void MergeRollbackFrom(Savepoint next) {
+		var nextActions = next.actions;
+		if (nextActions != null) {
+			for (Action action : nextActions) {
+				if (action.actionType == ActionType.ROLLBACK)
+					action.actionType = ActionType.NESTED_ROLLBACK;
+				else if (action.actionType != ActionType.NESTED_ROLLBACK)
+					continue;
+				getActionsForAdd().add(action);
+			}
+		}
+	}
+
+	public void MergeCommitActions(ArrayList<Action> transactionActions) {
+		var a = actions;
+		if (a != null) {
+			for (Action action : a) {
+				if (action.actionType == ActionType.COMMIT || action.actionType == ActionType.NESTED_ROLLBACK)
+					transactionActions.add(action);
+			}
+		}
+	}
+
+	public void MergeRollbackActions(ArrayList<Action> transactionActions) {
+		var a = actions;
+		if (a != null) {
+			for (Action action : a) {
+				if (action.actionType == ActionType.ROLLBACK || action.actionType == ActionType.NESTED_ROLLBACK)
+					transactionActions.add(action);
+			}
+		}
 	}
 
 	public void Commit() {
-		Logs.foreachValue(Log::Commit);
-	}
-
-	public void Rollback() {
+		var logs = Logs;
+		if (logs != null)
+			logs.foreachValue(Log::Commit);
 	}
 }

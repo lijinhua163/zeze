@@ -1,6 +1,5 @@
 package Zeze.Transaction;
 
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import Zeze.Application;
 import Zeze.Net.AsyncSocket;
@@ -8,7 +7,9 @@ import Zeze.Net.Binary;
 import Zeze.Net.Connector;
 import Zeze.Net.Service;
 import Zeze.Serialize.ByteBuffer;
+import Zeze.Services.AchillesHeelConfig;
 import Zeze.Services.GlobalCacheManager.Acquire;
+import Zeze.Services.GlobalCacheManager.KeepAlive;
 import Zeze.Services.GlobalCacheManager.Login;
 import Zeze.Services.GlobalCacheManager.NormalClose;
 import Zeze.Services.GlobalCacheManager.ReLogin;
@@ -19,21 +20,38 @@ import org.apache.logging.log4j.Logger;
 
 public final class GlobalAgent implements IGlobalAgent {
 	private static final Logger logger = LogManager.getLogger(GlobalAgent.class);
+	private static final boolean isDebugEnabled = logger.isDebugEnabled();
 
-	public static final class Agent {
-		private static final long FastErrorPeriod = 10 * 1000; // 10 seconds
-
+	public static final class Agent extends GlobalAgentBase {
 		private final Connector connector;
 		private final AtomicLong LoginTimes = new AtomicLong();
-		private final int GlobalCacheManagerHashIndex;
 		private boolean ActiveClose;
 		private volatile long LastErrorTime;
 
-		public Agent(GlobalClient client, String host, int port, int _GlobalCacheManagerHashIndex) {
+		public Agent(Zeze.Application zeze, GlobalClient client, String host, int port, int _GlobalCacheManagerHashIndex) {
+			super(zeze);
 			connector = new Zeze.Net.Connector(host, port, true);
 			connector.UserState = this;
-			GlobalCacheManagerHashIndex = _GlobalCacheManagerHashIndex;
+			super.GlobalCacheManagerHashIndex = _GlobalCacheManagerHashIndex;
+			connector.setMaxReconnectDelay(AchillesHeelConfig.ReconnectTimer);
 			client.getConfig().AddConnector(connector);
+		}
+
+		@Override
+		protected void cancelPending() {
+			// 非Raft版本没有Pending，不需要执行操作。以后如果实现了Pending，需要实现Cancel。
+		}
+
+		@Override
+		public void keepAlive() {
+			if (null == getConfig())
+				return; // not login
+
+			new KeepAlive().Send(connector.TryGetReadySocket(), rpc -> {
+				if (!rpc.isTimeout() && rpc.getResultCode() == 0)
+					setActiveTime(System.currentTimeMillis()); // KeepAlive.Response
+				return 0;
+			}, getConfig().KeepAliveTimeout);
 		}
 
 		public AtomicLong getLoginTimes() {
@@ -51,25 +69,27 @@ public final class GlobalAgent implements IGlobalAgent {
 			throw new RuntimeException(msg, cause);
 		}
 
+		void verifyFastFail() {
+			if (System.currentTimeMillis() - LastErrorTime < getConfig().ServerFastErrorPeriod)
+				ThrowException("GlobalAgent In FastErrorPeriod", null); // abort
+			// else continue
+		}
+
+		void setFastFail() {
+			var now = System.currentTimeMillis();
+			if (now - LastErrorTime > getConfig().ServerFastErrorPeriod)
+				LastErrorTime = now;
+		}
+
 		public AsyncSocket Connect() {
 			try {
 				var so = connector.TryGetReadySocket();
 				if (so != null)
 					return so;
 
-				synchronized (this) {
-					if (System.currentTimeMillis() - LastErrorTime < FastErrorPeriod)
-						ThrowException("GlobalAgent In FastErrorPeriod", null); // abort
-					// else continue
-				}
-
 				return connector.WaitReady();
 			} catch (Throwable abort) {
-				var now = System.currentTimeMillis();
-				synchronized (this) {
-					if (now - LastErrorTime > FastErrorPeriod)
-						LastErrorTime = now;
-				}
+				setFastFail();
 				ThrowException("GlobalAgent Login Failed", abort);
 			}
 			return null; // never got here.
@@ -88,21 +108,6 @@ public final class GlobalAgent implements IGlobalAgent {
 					new NormalClose().SendForWait(ready).await();
 			} finally {
 				connector.Stop(); // 正常关闭，先设置这个，以后 OnSocketClose 的时候判断做不同的处理。
-			}
-		}
-
-		public void OnSocketClose(GlobalClient client, Throwable ignoredEx) {
-			synchronized (this) {
-				if (ActiveClose)
-					return; // Connector 的状态在它自己的回调里面处理。
-			}
-
-			if (connector.isHandshakeDone()) {
-				for (var database : client.getZeze().getDatabases().values()) {
-					for (var table : database.getTables())
-						table.ReduceInvalidAllLocalOnly(getGlobalCacheManagerHashIndex());
-				}
-				client.getZeze().CheckpointRun();
 			}
 		}
 	}
@@ -138,17 +143,27 @@ public final class GlobalAgent implements IGlobalAgent {
 	}
 
 	@Override
-	public AcquireResult Acquire(Binary gkey, int state) {
+	public AcquireResult Acquire(Binary gkey, int state, boolean fresh) {
 		if (Client != null) {
 			var agent = Agents[GetGlobalCacheManagerHashIndex(gkey)]; // hash
+			if (agent.isReleasing()) {
+				agent.setFastFail();
+				var trans = Transaction.getCurrent();
+				if (trans == null)
+					throw new GoBackZeze("Acquire In Releasing");
+				trans.ThrowAbort("Acquire In Releasing", null);
+			}
+			agent.verifyFastFail();
 			var socket = agent.Connect();
-
 			// 请求处理错误抛出异常（比如网络或者GlobalCacheManager已经不存在了），打断外面的事务。
 			// 一个请求异常不关闭连接，尝试继续工作。
 			var rpc = new Acquire(gkey, state);
+			if (fresh)
+				rpc.setResultCode(GlobalCacheManagerServer.AcquireFreshSource);
 			try {
-				rpc.SendForWait(socket, 12000).get();
-			} catch (InterruptedException | ExecutionException e) {
+				rpc.SendForWait(socket, agent.getConfig().AcquireTimeout).get();
+			} catch (Throwable e) {
+				agent.setFastFail(); // 一般是超时失败，此时必须进入快速失败模式。
 				var trans = Transaction.getCurrent();
 				if (trans == null)
 					throw new GoBackZeze("Acquire", e);
@@ -161,6 +176,9 @@ public final class GlobalAgent implements IGlobalAgent {
 			    logger.Warn("Acquire ResultCode={0} {1}", rpc.ResultCode, rpc.Result);
 			}
 			*/
+			if (!rpc.isTimeout())
+				agent.setActiveTime(System.currentTimeMillis()); // Acquire.Response
+
 			if (rpc.getResultCode() == GlobalCacheManagerServer.AcquireModifyFailed
 					|| rpc.getResultCode() == GlobalCacheManagerServer.AcquireShareFailed) {
 				var trans = Transaction.getCurrent();
@@ -169,10 +187,13 @@ public final class GlobalAgent implements IGlobalAgent {
 				trans.ThrowAbort("GlobalAgent.Acquire Failed", null);
 				// never got here
 			}
-			return new AcquireResult(rpc.getResultCode(), rpc.Result.State, rpc.Result.GlobalSerialId);
+			var rc = rpc.getResultCode();
+			state = rpc.Result.State;
+			return rc == 0 ? AcquireResult.getSuccessResult(state) : new AcquireResult(rc, state);
 		}
-		logger.debug("Acquire local ++++++");
-		return new AcquireResult(0, state, 0);
+		if (isDebugEnabled)
+			logger.debug("Acquire local ++++++");
+		return AcquireResult.getSuccessResult(state);
 	}
 
 	public int ProcessReduceRequest(Reduce rpc) {
@@ -229,11 +250,13 @@ public final class GlobalAgent implements IGlobalAgent {
 				new Service.ProtocolFactoryHandle<>(ReLogin::new, null, TransactionLevel.None));
 		Client.AddFactoryHandle(NormalClose.TypeId_,
 				new Service.ProtocolFactoryHandle<>(NormalClose::new, null, TransactionLevel.None));
+		Client.AddFactoryHandle(KeepAlive.TypeId_,
+				new Service.ProtocolFactoryHandle<>(KeepAlive::new, null, TransactionLevel.None));
 
 		Agents = new Agent[hostNameOrAddress.length];
 		for (int i = 0; i < hostNameOrAddress.length; i++) {
 			var hp = hostNameOrAddress[i].split(":", -1);
-			Agents[i] = new Agent(Client, hp[0], hp.length > 1 ? Integer.parseInt(hp[1]) : port, i);
+			Agents[i] = new Agent(Zeze, Client, hp[0], hp.length > 1 ? Integer.parseInt(hp[1]) : port, i);
 		}
 
 		Client.Start();

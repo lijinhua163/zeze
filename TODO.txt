@@ -1,22 +1,113 @@
 【TODO】
-Zeze 打包和更新工具
+打包和更新工具
 ConfigEditor 自动完成: Foreign；自动id，Load 的时候记录maxid，以后编辑AddRow都使用这个递增；
 ConfigEditor 更多自动完成？普通的列默认最近使用的n个值，根据输入在列中查找最匹配的。
 ConfigEditor enum 现在不支持引用在其他文档定义的，有需要了再来加。
 war？一个module集合。定义export？private？App.Instance？生成代码使用基类，不再使用具体类型，感觉没必要：应用使用独立进程更加安全灵活些。
 ----------------------------------------------------------------------------------------------------------------------------------
 DatabaseTikv.OperatesTikv
-一致性hash负载分配算法：解决provider变动带来的原来分配方式（hash%count)导致re-hash造成cache大量重来的问题。
-too many try: 从Global得到锁以后，确保本地至少用过一次（事务成功），才允许Reduce。
-Handshake 是否加密可以配置。
 ServiceConf.Acceptor ip="@internal" "@external"
+Task
+Universe
+Zege
+DatagramChannel
+DatagramSocket
+AchillesHeelDaemon：安全级别从jvm级别提升到操作系统。保留线程守护，增加进程守护。两个守护兼容：
+  gs启动的时候检查mmap，发现自己是daemon启动的，就开启进程守护（向mmap报告和读取命令），否则还是原来的线程守护。
+
+【2022/7/15】
+
+------------------------------------------------------------------------------------------------------------------------------
+tag 1.0.0 Stable? ^_^
+------------------------------------------------------------------------------------------------------------------------------
+Bean 依赖环检测。允许容器依赖环。
+TableX.FlushWhenReduce 去掉回调方式，去掉Period支持（直接抛异常）。
+raft.agent 永远尝试会造成大量服务不可用风险。
+java Remove ServiceInfo.LocalState
+1. BUG，ReduceInvalidAllLocalOnly 没有Flush。
+2. BUG，TableX.Load 发现 Invalid 再去Acquire并Storage.Load时，如果本地记录是脏的，数据就会被覆盖。
+   刚才TableX.Load的问题造成的可能原因分析：本地数据被Daemon.Release，是没有刷新到后台的，
+   如果中间重新连上Global就会出现这个情况。但奇怪的是Daemon在你跑测试的时候是没有在工作的。
+   这点的其他可能原因你也分析一下？
+   虽然补丁好像可以Load时，if (!Record.Dirty) Storage.Load；但这个没有找到真正原因前，这个补丁有点危险。
+   【修改：Reduce的时候，锁内执行Flush】
+
+RedirectHash & RedirectAll & ChoiceHash - 单点数据分块支持与一致性Hash算法修改（原方案有问题：数据分块不能在服务器选择之后保持独立性）
+	DataConcurrentLevel：数据分块数量。
+	1. DataConcurrentLevel大于1 服务器选择：
+	var ha = hash(account);
+	var di = ha % DataConcurrentLevel; // account被分成Level个集合，每个集合访问一块数据
+	var h = hash(di); // 不再考虑原始hash，参见后面第2.点。
+	var server = ConsientHash(h);
+	问题：
+	   DataConcurrentLevel个数据块的访问是不是被分割成独立集合，每个集合在一个server内访问？
+	2. DataConcurrentLevel=1服务器选择。
+	var ha = hash(account);
+	var server = ConsientHash(ha);
+	问题：
+	   相同的account在一个server上。这个显然没问题了。
+ServiceManager.Agent Remove ServiceInfo.LocalState
+【重大BUG】 即使锁内。Record.Global.State 可能没有提升到需要水平。需要重新_check_。
+一致性hash负载分配算法, 【c# 没有TreeMap.tailMap。】
+Table.WalkKey
+Global-Server错误码分析
+1. Warning
+global 统计增加了Acquire和Reduce ResultCode的统计, GlobalRaft跑Simulate时,Acquire出现过以下失败情况:
+ public static final long Exception = -1;
+ public static final long RaftRetry = -15;
+ int AcquireShareDeadLockFound = 21;
+ int AcquireShareAlreadyIsModify = 22;
+ int AcquireModifyDeadLockFound = 23;
+ int AcquireModifyAlreadyIsModify = 25;
+ int AcquireShareFailed = 26;
+ int AcquireModifyFailed = 27;
+2. Fatal
+ERROR [] Table: RocksRaft Process Exception
+java.lang.IllegalStateException: CacheState state error
+ at Zeze.Services.GlobalCacheManagerWithRaft.AcquireShare(GlobalCacheManagerWithRaft.java:188)
 
 【2022/6/11】
 
 ------------------------------------------------------------------------------------------------------------------------------
-tag 0.9.7 
+tag 0.9.9 Random Sleep For Global-Dead-Lock and Too-Many-Try & Global Restart ...
 ------------------------------------------------------------------------------------------------------------------------------
+【TryWaitFlushWhenRecude 去掉啦】
+Too Many Try: Fresh机制下由Global提供排队方案草稿：
+  1. Server发现本地Fresh，拒绝Reduce。
+  2. Global发现由于Fresh的拒绝，把申请者加入队列。
+  3. Server把set Fresh=false时，发送通知给Global。
+  4. Global收到Fresh==false通知，选择队列中的一个申请者开始处理。
+  5. Global-Fresh队列管理。
+     需要定时轮询的方式启动队列中的请求进行重做，防止Fresh=false通知丢失。
+     请求总超时管理按一般请求超时处理。
+     问题：请求第一次来的时候要不要判断Fresh队列不为空，然后马上加入队列。
+  【死锁检测忙等问题】
+     由于死锁检测必须返回结果，没法使用队列，所以这个问题不好解决。
+     死锁检测原来的忙等解决方案是：TryWaitFlushWhenRecude，但仍然存在一个忙等窗口：
+     当一个申请在进行过程中，CacheState还没有更新时，忙等仍然存在。
+  【总结】
+     用随机延迟一起解决Fresh排队和死锁检测忙等，上面的Fresh队列也不实现了。
+-------------------------------------------------------------------------------------------
+Arch：模块默认订阅类型设置为，SubsribeTypeSimple。（准备以后改成一致性hash算法）。
+Global宕机：Server重连发送ReLogin，此时新启动的Global需要拒绝ReLogin，然后Server释放本地所有锁，重新发Login才能登录。
+Gen: transient 应用到所有版本。
+Too Many Try: Fresh机制下由Global提供排队方案草稿：
+  0.【先采用临时方案】Server在RedoAndReleaseLock时随机Sleep延迟。
+
+------------------------------------------------------------------------------------------------------------------------------
+tag 0.9.8 AchillesHeel & Handshake & Too Many Try
+------------------------------------------------------------------------------------------------------------------------------
+Handshake 是否加密可以配置。默认不加密。
+AsyncSocket.VerifySecurity 在 CHandshakeDone处理时调用一次。不再需要在DispatchProtocol时调用。
 Global错误处理：GS增加AchillesHeelDaemon，申请token（特别的keepalive）机制，本地释放锁超时，如果稍有不正常，就自杀。
+too many try: 从Global得到锁以后，确保本地至少用过一次（事务成功），才允许Reduce。
+Global-Server 错误恢复测试。1. Server 强制杀掉，8秒内重启。2. Server 强制杀掉，Global一定时间后回收记录锁。
+Java Apply Zeze.Transaction.Logs
+
+------------------------------------------------------------------------------------------------------------------------------
+tag 0.9.7 Java TableCache SoftReference Fix Bug Timestamp Value Access Order
+------------------------------------------------------------------------------------------------------------------------------
+Global错误处理：GS增加AchillesHeelDaemon，申请token（特别的keepalive）机制，本地释放锁超时，如果稍有不正常，就自杀。【草稿】
 LinkedMap.BLinkedMapNodeValue 里面保存了key，但是walk接口没有返回，需要在dynamic里面再次定义。【callback返回key(id)，而不是nodeid】
 LinkedMap.GetOrAdd
 Zege 框架搭建完成。

@@ -113,6 +113,7 @@ public final class Transaction {
 	private final ArrayList<Savepoint> Savepoints = new ArrayList<>();
 	private final HashSet<PessimismLock> PessimismLocks = new HashSet<>();
 	private Changes Changes;
+	private List<Action0> LastRollbackActions;
 
 	public Changes getChanges() {
 		return Changes;
@@ -125,7 +126,8 @@ public final class Transaction {
 	}
 
 	public Log GetLog(long logKey) {
-		return Savepoints.isEmpty() ? null : Savepoints.get(Savepoints.size() - 1).GetLog(logKey);
+		var saveSize = Savepoints.size();
+		return saveSize > 0 ? Savepoints.get(saveSize - 1).GetLog(logKey) : null;
 	}
 
 	public void PutLog(Log log) {
@@ -149,52 +151,53 @@ public final class Transaction {
 	}
 
 	public void Begin() {
-		Savepoints.add(Savepoints.isEmpty() ? new Savepoint() : Savepoints.get(Savepoints.size() - 1).BeginSavepoint());
+		var saveSize = Savepoints.size();
+		Savepoints.add(saveSize > 0 ? Savepoints.get(saveSize - 1).BeginSavepoint() : new Savepoint());
 	}
 
 	public void Commit() {
-		int lastIndex = Savepoints.size() - 1;
-		if (lastIndex > 0)
-			Savepoints.get(lastIndex - 1).MergeFrom(Savepoints.remove(lastIndex), true); // 嵌套事务，把日志合并到上一层。
+		int saveSize = Savepoints.size();
+		if (saveSize > 1)
+			Savepoints.get(saveSize - 2).MergeCommitFrom(Savepoints.remove(saveSize - 1)); // 嵌套事务，把日志合并到上一层。
 		// else // 最外层存储过程提交在 Perform 中处理
 	}
-
-	private List<Action0> LastRollbackActions;
 
 	public void Rollback() {
 		int lastIndex = Savepoints.size() - 1;
 		Savepoint last = Savepoints.remove(lastIndex);
 		last.Rollback();
-
 		if (lastIndex > 0)
-			Savepoints.get(lastIndex - 1).MergeFrom(last, false);
+			Savepoints.get(lastIndex - 1).MergeRollbackFrom(last); // 嵌套事务，把日志合并到上一层。
 		else
-			LastRollbackActions = last.RollbackActions; // 最后一个Savepoint Rollback的时候需要保存一下，用来触发回调。ugly。
+			LastRollbackActions = last.getRollbackActions(); // 最后一个Savepoint Rollback的时候需要保存一下，用来触发回调。ugly。
 	}
 
 	public long Perform(Procedure procedure) throws Throwable {
 		try {
-			procedure.ResultCode = procedure.Call();
+			var rc = procedure.Call();
 			if (_lock_and_check_(TransactionLevel.Serializable)) {
-				if (procedure.ResultCode == 0)
+				if (rc == 0) {
 					_final_commit_(procedure);
-				else
+				} else {
+					procedure.setAutoResponseResultCode(rc);
 					_final_rollback_(procedure);
-				return procedure.ResultCode;
+				}
+				return rc;
 			}
+			procedure.setAutoResponseResultCode(rc);
 			_final_rollback_(procedure); // 乐观锁，这里应该redo
-			return procedure.ResultCode;
+			return rc;
 		} catch (ThrowAgainException e) {
-			procedure.ResultCode = Zeze.Transaction.Procedure.Exception;
+			procedure.setAutoResponseResultCode(Zeze.Transaction.Procedure.Exception);
 			_final_rollback_(procedure);
 			throw e;
 		} catch (RaftRetryException e) {
-			procedure.ResultCode = Zeze.Transaction.Procedure.RaftRetry;
+			procedure.setAutoResponseResultCode(Zeze.Transaction.Procedure.RaftRetry);
 			logger.debug("RocksRaft Retry", e);
 			_final_rollback_(procedure);
-			return procedure.ResultCode;
+			return Zeze.Transaction.Procedure.RaftRetry;
 		} catch (Throwable e) {
-			procedure.ResultCode = Zeze.Transaction.Procedure.Exception;
+			procedure.setAutoResponseResultCode(Zeze.Transaction.Procedure.Exception);
 			logger.error("RocksRaft Call Exception", e);
 			if (e instanceof AssertionError) {
 				_final_rollback_(procedure);
@@ -202,10 +205,10 @@ public final class Transaction {
 			}
 			if (_lock_and_check_(TransactionLevel.Serializable)) {
 				_final_rollback_(procedure);
-				return procedure.ResultCode;
+				return Zeze.Transaction.Procedure.Exception;
 			}
 			_final_rollback_(procedure); // 乐观锁，这里应该redo
-			return procedure.ResultCode;
+			return Zeze.Transaction.Procedure.Exception;
 		} finally {
 			for (var pLock : PessimismLocks)
 				pLock.unlock();
@@ -214,11 +217,13 @@ public final class Transaction {
 	}
 
 	public void LeaderApply(Changes changes) {
-		Savepoint sp = Savepoints.get(Savepoints.size() - 1);
-		for (var it = sp.getLogs().iterator(); it.moveToNext(); ) {
-			var log = it.value();
-			if (log.getBelong() != null)
-				log.getBelong().LeaderApplyNoRecursive(log);
+		var it = Savepoints.get(Savepoints.size() - 1).logIterator();
+		if (it != null) {
+			while (it.moveToNext()) {
+				var log = it.value();
+				if (log.getBelong() != null)
+					log.getBelong().LeaderApplyNoRecursive(log);
+			}
 		}
 		var rs = new ArrayList<Record<?>>();
 		for (var ar : AccessedRecords.values()) {
@@ -231,30 +236,34 @@ public final class Transaction {
 	}
 
 	public void RunWhileCommit(Action0 action) {
-		Savepoints.get(Savepoints.size() - 1).CommitActions.add(action);
+		Savepoints.get(Savepoints.size() - 1).addCommitAction(action);
 	}
 
 	public void RunWhileRollback(Action0 action) {
-		Savepoints.get(Savepoints.size() - 1).RollbackActions.add(action);
+		Savepoints.get(Savepoints.size() - 1).addRollbackAction(action);
 	}
 
 	private boolean _lock_and_check_(@SuppressWarnings("SameParameterValue") TransactionLevel level) {
 		boolean allRead = true;
-		if (!Savepoints.isEmpty()) {
-			for (var it = Savepoints.get(Savepoints.size() - 1).getLogs().iterator(); it.moveToNext(); ) {
-				var log = it.value();
-				// 特殊日志。不是 bean 的修改日志，当然也不会修改 Record。
-				// 现在不会有这种情况，保留给未来扩展需要。
-				if (log.getBelong() == null)
-					continue;
+		var saveSize = Savepoints.size();
+		if (saveSize > 0) {
+			var it = Savepoints.get(saveSize - 1).logIterator();
+			if (it != null) {
+				while (it.moveToNext()) {
+					var log = it.value();
+					// 特殊日志。不是 bean 的修改日志，当然也不会修改 Record。
+					// 现在不会有这种情况，保留给未来扩展需要。
+					if (log.getBelong() == null)
+						continue;
 
-				TableKey tkey = log.getBelong().getTableKey();
-				var record = AccessedRecords.get(tkey);
-				if (record != null) {
-					record.setDirty(true);
-					allRead = false;
-				} else
-					logger.fatal("impossible! record not found."); // 只有测试代码会把非 Managed 的 Bean 的日志加进来。
+					TableKey tkey = log.getBelong().getTableKey();
+					var record = AccessedRecords.get(tkey);
+					if (record != null) {
+						record.setDirty(true);
+						allRead = false;
+					} else
+						logger.fatal("impossible! record not found."); // 只有测试代码会把非 Managed 的 Bean 的日志加进来。
+				}
 			}
 		}
 		//noinspection IfStatementWithIdenticalBranches
@@ -267,15 +276,18 @@ public final class Transaction {
 		// Collect Changes
 		Savepoint sp = Savepoints.get(Savepoints.size() - 1);
 		Changes = new Changes(procedure.getRocks(), this, procedure.UniqueRequest);
-		for (var it = sp.getLogs().iterator(); it.moveToNext(); ) {
-			var log = it.value();
-			// 这里都是修改操作的日志，没有Owner的日志是特殊测试目的加入的，简单忽略即可。
-			if (log.getBelong() == null)
-				continue;
+		var it = sp.logIterator();
+		if (it != null) {
+			while (it.moveToNext()) {
+				var log = it.value();
+				// 这里都是修改操作的日志，没有Owner的日志是特殊测试目的加入的，简单忽略即可。
+				if (log.getBelong() == null)
+					continue;
 
-			// 当changes.Collect在日志往上一级传递时调用，
-			// 第一个参数Owner为null，表示bean属于record，到达root了。
-			Changes.Collect(log.getBelong(), log);
+				// 当changes.Collect在日志往上一级传递时调用，
+				// 第一个参数Owner为null，表示bean属于record，到达root了。
+				Changes.Collect(log.getBelong(), log);
+			}
 		}
 
 		for (var ar : AccessedRecords.values()) {
@@ -293,33 +305,37 @@ public final class Transaction {
 
 		Protocol<?> autoResponse = procedure.AutoResponse;
 		if (autoResponse != null)
-			autoResponse.SendResultCode(procedure.ResultCode);
+			autoResponse.SendResult();
 	}
 
 	private void _trigger_commit_actions_(Procedure procedure, Savepoint last) {
-		for (var action : last.CommitActions) {
-			try {
-				action.run();
-			} catch (Throwable ex) {
-				logger.error(() -> "Commit Procedure " + procedure + " Action " + action.getClass().getName(), ex);
-			}
-		}
-		last.CommitActions.clear();
-	}
-
-	private void _final_rollback_(Procedure procedure) {
-		if (LastRollbackActions != null) {
-			for (var action : LastRollbackActions) {
+		var commitActions = last.getCommitActions();
+		if (commitActions != null) {
+			for (var action : commitActions) {
 				try {
 					action.run();
 				} catch (Throwable ex) {
-					logger.error(() -> "Commit Procedure " + procedure + " Action " + action.getClass().getName(), ex);
+					logger.error("Commit Procedure {} Action {}", procedure, action.getClass().getName(), ex);
+				}
+			}
+			commitActions.clear();
+		}
+	}
+
+	private void _final_rollback_(Procedure procedure) {
+		var rollbackActions = LastRollbackActions;
+		if (rollbackActions != null) {
+			for (var action : rollbackActions) {
+				try {
+					action.run();
+				} catch (Throwable ex) {
+					logger.error("Commit Procedure {} Action {}", procedure, action.getClass().getName(), ex);
 				}
 			}
 			LastRollbackActions = null;
 		}
 		Protocol<?> autoResponse = procedure.AutoResponse;
 		if (autoResponse != null)
-			autoResponse.SendResultCode(procedure.ResultCode);
+			autoResponse.SendResult();
 	}
 }

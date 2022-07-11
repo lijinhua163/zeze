@@ -1,140 +1,192 @@
 package Zeze.Transaction;
 
-import org.apache.logging.log4j.LogManager;
-import org.rocksdb.*;
-import org.apache.logging.log4j.Logger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
-import Zeze.*;
+import Zeze.Config;
 import Zeze.Serialize.ByteBuffer;
+import Zeze.Util.KV;
+import Zeze.Util.OutObject;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.Options;
+import org.rocksdb.ReadOptions;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 
 public class DatabaseRocksDb extends Database {
-	private static final Logger logger = LogManager.getLogger(DatabaseRocksDb.class);
+	private static final Options commonOptions = new Options()
+			.setCreateIfMissing(true)
+			.setDbWriteBufferSize(64 << 20) // 总的写缓存大小(字节),对所有columns的总限制
+			.setKeepLogFileNum(5); // 保留"LOG.old.*"文件的数量
+	private static final DBOptions commonDbOptions = new DBOptions()
+			.setCreateIfMissing(true)
+			.setDbWriteBufferSize(64 << 20) // 总的写缓存大小(字节),对所有columns的总限制
+			.setKeepLogFileNum(5); // 保留"LOG.old.*"文件的数量
+	private static final ColumnFamilyOptions defaultCfOptions = new ColumnFamilyOptions();
+	private static final ReadOptions defaultReadOptions = new ReadOptions();
+	private static final WriteOptions defaultWriteOptions = new WriteOptions();
+	private static final WriteOptions syncWriteOptions = new WriteOptions().setSync(true);
 
-	private final RocksDB Db;
-	private final WriteOptions WriteOptions = new WriteOptions();
-	private final ReadOptions ReadOptions = new ReadOptions();
-	private final ColumnFamilyOptions CfOptions = new ColumnFamilyOptions();
-	private final ConcurrentHashMap<String, ColumnFamilyHandle> ColumnFamilies = new ConcurrentHashMap<>();
+	private final RocksDB rocksDb;
+	private final ConcurrentHashMap<String, ColumnFamilyHandle> columnFamilies = new ConcurrentHashMap<>();
 
-	static{
+	static {
 		RocksDB.loadLibrary();
 	}
 
-	public static RocksDB Open(final DBOptions options, final String path,
-							   final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
-							   final List<ColumnFamilyHandle> columnFamilyHandles) throws RocksDBException {
-		RocksDBException lastE = null;
-		for (int i = 0; i < 10; ++i) {
+	public static Options getCommonOptions() {
+		return commonOptions;
+	}
+
+	public static DBOptions getCommonDbOptions() {
+		return commonDbOptions;
+	}
+
+	public static ColumnFamilyOptions getDefaultCfOptions() {
+		return defaultCfOptions;
+	}
+
+	public static ReadOptions getDefaultReadOptions() {
+		return defaultReadOptions;
+	}
+
+	public static WriteOptions getDefaultWriteOptions() {
+		return defaultWriteOptions;
+	}
+
+	public static WriteOptions getSyncWriteOptions() {
+		return syncWriteOptions;
+	}
+
+	public static RocksDB Open(DBOptions options, String path, List<ColumnFamilyDescriptor> columnFamilyDescriptors,
+							   List<ColumnFamilyHandle> columnFamilyHandles) throws RocksDBException {
+		for (int i = 0; ; ) {
 			try {
 				return RocksDB.open(options, path, columnFamilyDescriptors, columnFamilyHandles);
 			} catch (RocksDBException e) {
-				logger.info("RocksDB.open " + path, e);
-				lastE = e;
+				logger.warn("RocksDB.open {} failed:", path, e);
+				if (++i >= 10)
+					throw e;
 				try {
+					//noinspection BusyWait
 					Thread.sleep(1000);
 				} catch (InterruptedException ignored) {
+					throw e;
 				}
 			}
 		}
-		throw lastE;
 	}
 
 	public DatabaseRocksDb(Config.DatabaseConf conf) {
 		super(conf);
-		DBOptions dbOptions = new DBOptions();
-		dbOptions.setCreateIfMissing(true);
-		final String dbHome = conf.getDatabaseUrl().isEmpty() ? "db" : conf.getDatabaseUrl();
+		logger.info("new: {}", conf.getDatabaseUrl());
+
+		var dbHome = conf.getDatabaseUrl().isEmpty() ? "db" : conf.getDatabaseUrl();
 		try {
 			var columnFamilies = new ArrayList<ColumnFamilyDescriptor>();
-			org.rocksdb.Options options = new Options();
-			for (var cf : RocksDB.listColumnFamilies(options, dbHome)) {
-				columnFamilies.add(new ColumnFamilyDescriptor(cf, CfOptions));
-			}
-			if (columnFamilies.isEmpty()) {
-				columnFamilies.add(new ColumnFamilyDescriptor("default".getBytes(), CfOptions));
-			}
+			for (var cf : RocksDB.listColumnFamilies(commonOptions, dbHome))
+				columnFamilies.add(new ColumnFamilyDescriptor(cf, defaultCfOptions));
+			if (columnFamilies.isEmpty())
+				columnFamilies.add(new ColumnFamilyDescriptor("default".getBytes(StandardCharsets.UTF_8), defaultCfOptions));
 
 			// DirectOperates 依赖 Db，所以只能在这里打开。要不然，放在Open里面更加合理。
 			var outHandles = new ArrayList<ColumnFamilyHandle>();
-			Db = Open(dbOptions, dbHome, columnFamilies, outHandles);
+			rocksDb = Open(commonDbOptions, dbHome, columnFamilies, outHandles);
 
-			for (int i = 0; i < columnFamilies.size(); ++i){
-				var cf = columnFamilies.get(i);
-				var str = new String(cf.getName(), StandardCharsets.UTF_8);
-				ColumnFamilies.put(str, outHandles.get(i));
+			for (int i = 0; i < columnFamilies.size(); i++) {
+				var name = new String(columnFamilies.get(i).getName(), StandardCharsets.UTF_8);
+				this.columnFamilies.put(name, outHandles.get(i));
 			}
-			setDirectOperates(new OperatesRocksDb(this));
-		} catch (RocksDBException dbEx) {
-			throw new RuntimeException(dbEx);
+			setDirectOperates(new OperatesRocksDb());
+		} catch (RocksDBException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
 	@Override
 	public void Close() {
-		Db.close();
+		logger.info("Close: {}", getDatabaseUrl());
+		if (rocksDb.isOwningHandle()) {
+			try {
+				rocksDb.syncWal();
+			} catch (RocksDBException ignored) {
+			}
+		}
+		rocksDb.close();
 		super.Close();
-	}
-
-	public static class RocksDbTrans implements Transaction {
-		private final DatabaseRocksDb Database;
-		private final WriteBatch Batch;
-
-		public RocksDbTrans(DatabaseRocksDb database) {
-			Database = database;
-			Batch = new WriteBatch();
-		}
-
-		public final void Put(byte[] key, byte[] value, ColumnFamilyHandle family) {
-			try {
-				Batch.put(family, key, value);
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public final void Remove(byte[] key, ColumnFamilyHandle family) {
-			try {
-				Batch.delete(family, key);
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		@Override
-		public final void Commit() {
-			try {
-				Database.Db.write(Database.WriteOptions, Batch);
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		@Override
-		public final void Rollback() {
-		}
-
-		@Override
-		public final void close() {
-		}
 	}
 
 	@Override
 	public Transaction BeginTransaction() {
-		return new RocksDbTrans(this);
+		return new RocksDbTrans();
 	}
 
-	ColumnFamilyHandle getOrAddFamily(String name, Zeze.Util.OutObject<Boolean> isNew) {
-		if (null != isNew)
+	private final class RocksDbTrans implements Transaction {
+		private WriteBatch batch;
+
+		private WriteBatch getBatch() {
+			var wb = batch;
+			if (wb == null)
+				batch = wb = new WriteBatch();
+			return wb;
+		}
+
+		void Put(byte[] key, byte[] value, ColumnFamilyHandle family) {
+			try {
+				getBatch().put(family, key, value);
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		void Remove(byte[] key, ColumnFamilyHandle family) {
+			try {
+				getBatch().delete(family, key);
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		@Override
+		public void Commit() {
+			if (batch == null)
+				return;
+			try {
+				rocksDb.write(defaultWriteOptions, batch);
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		@Override
+		public void Rollback() {
+		}
+
+		@Override
+		public void close() {
+			if (batch != null) {
+				batch.close();
+				batch = null;
+			}
+		}
+	}
+
+	private ColumnFamilyHandle getOrAddFamily(String name, OutObject<Boolean> isNew) {
+		if (isNew != null)
 			isNew.Value = false;
 
-		return ColumnFamilies.computeIfAbsent(name, (key) -> {
+		return columnFamilies.computeIfAbsent(name, key -> {
 			try {
-				if (null != isNew)
+				if (isNew != null)
 					isNew.Value = true;
-				return Db.createColumnFamily(new ColumnFamilyDescriptor(key.getBytes(StandardCharsets.UTF_8), CfOptions));
+				return rocksDb.createColumnFamily(
+						new ColumnFamilyDescriptor(key.getBytes(StandardCharsets.UTF_8), defaultCfOptions));
 			} catch (RocksDBException e) {
 				throw new RuntimeException(e);
 			}
@@ -143,35 +195,23 @@ public class DatabaseRocksDb extends Database {
 
 	@Override
 	public Table OpenTable(String name) {
-		var isNew = new Zeze.Util.OutObject<Boolean>();
+		var isNew = new OutObject<Boolean>();
 		var cfh = getOrAddFamily(name, isNew);
-		return new TableRocksDb(this, name, cfh, isNew.Value);
+		return new TableRocksDb(cfh, isNew.Value);
 	}
 
-	public final static class TableRocksDb implements Database.Table {
-		private final DatabaseRocksDb DatabaseReal;
-		public DatabaseRocksDb getDatabaseReal() {
-			return DatabaseReal;
-		}
-		@Override
-		public Database getDatabase() {
-			return getDatabaseReal();
-		}
-		private final String Name;
-		public String getName() {
-			return Name;
-		}
-		private final ColumnFamilyHandle ColumnFamily;
-		private ColumnFamilyHandle getColumnFamily() {
-			return ColumnFamily;
-		}
+	private final class TableRocksDb implements Database.Table {
+		private final ColumnFamilyHandle columnFamily;
 		private final boolean isNew;
 
-		public TableRocksDb(DatabaseRocksDb database, String name, ColumnFamilyHandle cfh, boolean isNew) {
-			DatabaseReal = database;
-			Name = name;
-			ColumnFamily = cfh;
+		TableRocksDb(ColumnFamilyHandle columnFamily, boolean isNew) {
+			this.columnFamily = columnFamily;
 			this.isNew = isNew;
+		}
+
+		@Override
+		public DatabaseRocksDb getDatabase() {
+			return DatabaseRocksDb.this;
 		}
 
 		@Override
@@ -185,135 +225,116 @@ public class DatabaseRocksDb extends Database {
 
 		@Override
 		public ByteBuffer Find(ByteBuffer key) {
-			byte[] value;
 			try {
-				value = getDatabaseReal().Db.get(
-						getColumnFamily(), getDatabaseReal().ReadOptions, key.Bytes, key.ReadIndex, key.WriteIndex);
+				var value = rocksDb.get(columnFamily, defaultReadOptions, key.Bytes, key.ReadIndex, key.WriteIndex);
+				return value != null ? ByteBuffer.Wrap(value) : null;
 			} catch (RocksDBException e) {
 				throw new RuntimeException(e);
 			}
-			if (null == value) {
-				return null;
-			}
-			return ByteBuffer.Wrap(value);
 		}
 
 		@Override
-		public void Remove(Transaction t, ByteBuffer key) {
-			var txn = (RocksDbTrans)t;
-			txn.Remove(key.Copy(), getColumnFamily());
+		public void Remove(Transaction txn, ByteBuffer key) {
+			((RocksDbTrans)txn).Remove(key.Copy(), columnFamily);
 		}
 
 		@Override
-		public void Replace(Transaction t, ByteBuffer key, ByteBuffer value) {
-			var txn = (RocksDbTrans)t;
-			txn.Put(key.Copy(), value.Copy(), getColumnFamily());
+		public void Replace(Transaction txn, ByteBuffer key, ByteBuffer value) {
+			((RocksDbTrans)txn).Put(key.Copy(), value.Copy(), columnFamily);
 		}
 
 		@Override
 		public long Walk(TableWalkHandleRaw callback) {
-			try (var it = getDatabaseReal().Db.newIterator(getColumnFamily(), getDatabaseReal().ReadOptions)) {
+			try (var it = rocksDb.newIterator(columnFamily, defaultReadOptions)) {
 				long countWalked = 0;
-				it.seekToFirst();
-				while (it.isValid()) {
-					++countWalked;
-					if (!callback.handle(it.key(), it.value())) {
-						return countWalked;
-					}
-					it.next();
+				for (it.seekToFirst(); it.isValid(); it.next()) {
+					countWalked++;
+					if (!callback.handle(it.key(), it.value()))
+						break;
+				}
+				return countWalked;
+			}
+		}
+
+		@Override
+		public long WalkKey(TableWalkKeyRaw callback) {
+			try (var it = rocksDb.newIterator(columnFamily, defaultReadOptions)) {
+				long countWalked = 0;
+				for (it.seekToFirst(); it.isValid(); it.next()) {
+					countWalked++;
+					if (!callback.handle(it.key()))
+						break;
 				}
 				return countWalked;
 			}
 		}
 	}
 
-	public final static class OperatesRocksDb implements Operates {
-		private final DatabaseRocksDb DatabaseReal;
-		public DatabaseRocksDb getDatabaseReal() {
-			return DatabaseReal;
+	private static final class DVRocks extends DataWithVersion implements Zeze.Serialize.Serializable {
+		@Override
+		public void Encode(ByteBuffer bb) {
+			bb.WriteByteBuffer(Data);
+			bb.WriteLong(Version);
 		}
-		public Database getDatabase() {
-			return getDatabaseReal();
-		}
-		public static final String ColumnFamilyName = "zeze.OperatesRocksDb.Schemas";
-		private final ColumnFamilyHandle ColumnFamily;
 
-		public OperatesRocksDb(DatabaseRocksDb database) {
-			DatabaseReal = database;
-			ColumnFamily = getDatabaseReal().getOrAddFamily(ColumnFamilyName, null);
+		@Override
+		public void Decode(ByteBuffer bb) {
+			Data = ByteBuffer.Wrap(bb.ReadBytes());
+			Version = bb.ReadLong();
+		}
+
+		byte[] Encode() {
+			int size = Data.Size();
+			var bb = ByteBuffer.Allocate(ByteBuffer.writeUIntSize(size) + size + ByteBuffer.writeLongSize(Version));
+			Encode(bb);
+			return bb.Bytes;
+		}
+
+		static DVRocks Decode(byte[] bytes) {
+			var dv = new DVRocks();
+			if (bytes != null)
+				dv.Decode(ByteBuffer.Wrap(bytes));
+			return dv;
+		}
+	}
+
+	private final class OperatesRocksDb implements Operates {
+		private final ColumnFamilyHandle columnFamily = getOrAddFamily("zeze.OperatesRocksDb.Schemas", null);
+
+		@Override
+		public synchronized DataWithVersion GetDataWithVersion(ByteBuffer key) {
+			try {
+				return DVRocks.Decode(rocksDb.get(columnFamily, key.Copy()));
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		@Override
+		public synchronized KV<Long, Boolean> SaveDataWithSameVersion(ByteBuffer key, ByteBuffer data, long version) {
+			try {
+				var dv = DVRocks.Decode(rocksDb.get(columnFamily, key.Copy()));
+				if (dv.Version != version)
+					return KV.Create(version, false);
+
+				dv.Version = ++version;
+				dv.Data = data;
+				rocksDb.put(columnFamily, defaultWriteOptions, key.Copy(), dv.Encode());
+				return KV.Create(version, true);
+			} catch (RocksDBException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		@Override
+		public void SetInUse(int localId, String global) {
+			// rocksdb 独占由它自己打开的时候保证。
 		}
 
 		@Override
 		public int ClearInUse(int localId, String global) {
 			// rocksdb 独占由它自己打开的时候保证。
 			return 0;
-		}
-
-		private static class DVRocks extends DataWithVersion implements Zeze.Serialize.Serializable {
-			@Override
-			public final void Decode(ByteBuffer bb) {
-				Data = ByteBuffer.Wrap(bb.ReadBytes());
-				Version = bb.ReadLong();
-			}
-
-			@Override
-			public final void Encode(ByteBuffer bb) {
-				bb.WriteByteBuffer(Data);
-				bb.WriteLong(Version);
-			}
-
-			public static DVRocks Decode(byte[] bytes) {
-				if (null == bytes) {
-					return new DVRocks();
-				}
-				var dv = new DVRocks();
-				dv.Decode(ByteBuffer.Wrap(bytes));
-				return dv;
-			}
-
-			public final byte[] Encode() {
-				int dataSize = Data.Size();
-				var bb = ByteBuffer.Allocate(ByteBuffer.writeUIntSize(dataSize) + dataSize + ByteBuffer.writeLongSize(Version));
-				this.Encode(bb);
-				return bb.Bytes;
-			}
-		}
-
-		@Override
-		public synchronized DataWithVersion GetDataWithVersion(ByteBuffer key) {
-			try {
-				return DVRocks.Decode(DatabaseReal.Db.get(ColumnFamily, key.Copy()));
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		@Override
-		public synchronized Zeze.Util.KV<Long, Boolean> SaveDataWithSameVersion(ByteBuffer key, ByteBuffer data, long version) {
-			DVRocks dv;
-			try {
-				dv = DVRocks.Decode(getDatabaseReal().Db.get(ColumnFamily, key.Copy()));
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-			if (dv.Version != version) {
-				return Zeze.Util.KV.Create(version, false);
-			}
-
-			version++;
-			dv.Version = version;
-			dv.Data = data;
-			try {
-				getDatabaseReal().Db.put(ColumnFamily, getDatabaseReal().WriteOptions, key.Copy(), dv.Encode());
-			} catch (RocksDBException e) {
-				throw new RuntimeException(e);
-			}
-			return Zeze.Util.KV.Create(version, true);
-		}
-
-		@Override
-		public void SetInUse(int localId, String global) {
-			// rocksdb 独占由它自己打开的时候保证。
 		}
 	}
 }

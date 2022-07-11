@@ -87,19 +87,17 @@ namespace Zeze.Transaction
                         return r;
                     }
 
-                    var (ResultCode, ResultState, ResultGlobalSerialId) = await r.Acquire(GlobalCacheManagerServer.StateShare);
+                    var (ResultCode, ResultState) = await r.Acquire(GlobalCacheManagerServer.StateShare, false);
                     r.State = ResultState;
                     if (r.State == GlobalCacheManagerServer.StateInvalid)
                     {
-                        r.LastErrorGlobalSerialId = ResultGlobalSerialId; // save
                         var txn = Transaction.Current;
-                        txn.LastTableKeyOfRedoAndRelease = tkey;
-                        txn.LastGlobalSerialIdOfRedoAndRelease = ResultGlobalSerialId;
                         txn.ThrowRedoAndReleaseLock(tkey.ToString() + ":" + r.ToString());
                         //throw new RedoAndReleaseLockException();
                     }
 
                     r.Timestamp = Record.NextTimestamp;
+                    r.SetFreshAcquire();
 
                     if (null != TStorage)
                     {
@@ -142,11 +140,13 @@ namespace Zeze.Transaction
 
         internal override async Task<int> ReduceShare(Reduce rpc, ByteBuffer bbkey)
         {
+            var fresh = rpc.ResultCode;
+            rpc.ResultCode = 0;
+
             logger.Debug("ReduceShare NewState={0}", rpc.Argument.State);
 
             rpc.Result.GlobalKey = rpc.Argument.GlobalKey;
             rpc.Result.State = rpc.Argument.State;
-            rpc.Result.GlobalSerialId = rpc.Argument.GlobalSerialId;
 
             K key = DecodeKey(bbkey);
 
@@ -164,11 +164,17 @@ namespace Zeze.Transaction
                     rpc.Result.State = GlobalCacheManagerServer.StateInvalid;
                     logger.Debug("ReduceShare SendResult 1 {0}", r);
                     rpc.SendResultCode(GlobalCacheManagerServer.ReduceShareAlreadyIsInvalid);
-                    await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                     return 0;
                 }
                 using var lockr = r.Mutex.Lock();
-                r.LastErrorGlobalSerialId = rpc.Argument.GlobalSerialId;
+                if (fresh != GlobalCacheManagerServer.AcquireFreshSource && r.IsFreshAcquire())
+                {
+                    logger.Debug("Reduce SendResult fresh {}", r);
+                    rpc.Result.State = GlobalCacheManagerServer.StateReduceErrorFreshAcquire;
+                    rpc.SendResult();
+                    return 0;
+                }
+                r.SetNotFresh(); // 被降级不再新鲜。
                 switch (r.State)
                 {
                     case GlobalCacheManagerServer.StateRemoved: // impossible! safe only.
@@ -176,7 +182,6 @@ namespace Zeze.Transaction
                         rpc.Result.State = GlobalCacheManagerServer.StateInvalid;
                         logger.Debug("ReduceShare SendResult 2 {0}", r);
                         rpc.SendResultCode(GlobalCacheManagerServer.ReduceShareAlreadyIsInvalid);
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
 
                     case GlobalCacheManagerServer.StateShare:
@@ -186,7 +191,6 @@ namespace Zeze.Transaction
                             break;
                         logger.Debug("ReduceShare SendResult 3 {0}", r);
                         rpc.SendResult();
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
 
                     case GlobalCacheManagerServer.StateModify:
@@ -195,22 +199,17 @@ namespace Zeze.Transaction
                             break;
                         logger.Debug("ReduceShare SendResult * {0}", r);
                         rpc.SendResult();
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
                 }
+                rpc.Result.State = GlobalCacheManagerServer.StateShare;
+                await FlushWhenReduce(r);
+                logger.Debug("ReduceShare SendResult 4 {0}", r);
+                rpc.SendResult();
             }
             finally
             {
                 lockey.Release();
             }
-            //logger.Warn("ReduceShare checkpoint begin. id={0} {1}", r, tkey);
-            rpc.Result.State = GlobalCacheManagerServer.StateShare;
-            await FlushWhenReduce(r);
-            logger.Debug("ReduceShare SendResult 4 {0}", r);
-            // Must before SendResult
-            rpc.SendResult();
-            await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
-            //logger.Warn("ReduceShare checkpoint end. id={0} {1}", r, tkey);
             return 0;
         }
 
@@ -234,11 +233,13 @@ namespace Zeze.Transaction
 
         internal override async Task<int> ReduceInvalid(Reduce rpc, ByteBuffer bbkey)
         {
+            var fresh = rpc.ResultCode;
+            rpc.ResultCode = 0;
+
             logger.Debug("ReduceInvalid NewState={0}", rpc.Argument.State);
 
             rpc.Result.GlobalKey = rpc.Argument.GlobalKey;
             rpc.Result.State = rpc.Argument.State;
-            rpc.Result.GlobalSerialId = rpc.Argument.GlobalSerialId;
 
             K key = DecodeKey(bbkey);
 
@@ -253,11 +254,17 @@ namespace Zeze.Transaction
                     rpc.Result.State = GlobalCacheManagerServer.StateInvalid;
                     logger.Debug("ReduceInvalid SendResult 1 {0}", r);
                     rpc.SendResultCode(GlobalCacheManagerServer.ReduceInvalidAlreadyIsInvalid);
-                    await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                     return 0;
                 }
                 using var lockr = r.Mutex.Lock();
-                r.LastErrorGlobalSerialId = rpc.Argument.GlobalSerialId;
+                if (fresh != GlobalCacheManagerServer.AcquireFreshSource && r.IsFreshAcquire())
+                {
+                    logger.Debug("Reduce SendResult fresh {}", r);
+                    rpc.Result.State = GlobalCacheManagerServer.StateReduceErrorFreshAcquire;
+                    rpc.SendResult();
+                    return 0;
+                }
+                r.SetNotFresh(); // 被降级不再新鲜。
                 switch (r.State)
                 {
                     case GlobalCacheManagerServer.StateRemoved: // impossible! safe only.
@@ -268,7 +275,6 @@ namespace Zeze.Transaction
                             break;
                         logger.Debug("ReduceInvalid SendResult 2 {0}", r);
                         rpc.SendResult();
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
 
                     case GlobalCacheManagerServer.StateShare:
@@ -278,7 +284,6 @@ namespace Zeze.Transaction
                             break;
                         logger.Debug("ReduceInvalid SendResult 3 {0}", r);
                         rpc.SendResult();
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
 
                     case GlobalCacheManagerServer.StateModify:
@@ -286,22 +291,17 @@ namespace Zeze.Transaction
                         if (r.Dirty)
                             break;
                         rpc.SendResult();
-                        await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
                         return 0;
                 }
+                rpc.Result.State = GlobalCacheManagerServer.StateInvalid;
+                await FlushWhenReduce(r);
+                logger.Debug("ReduceInvalid SendResult 4 {0} ", r);
+                rpc.SendResult();
             }
             finally
             {
                 lockey.Release();
             }
-            //logger.Warn("ReduceInvalid checkpoint begin. id={0} {1}", r, tkey);
-            rpc.Result.State = GlobalCacheManagerServer.StateInvalid;
-            await FlushWhenReduce(r);
-            logger.Debug("ReduceInvalid SendResult 4 {0} ", r);
-            // Must before SendResult
-            rpc.SendResult();
-            await Zeze.SetLastGlobalSerialId(tkey, rpc.Argument.GlobalSerialId);
-            //logger.Warn("ReduceInvalid checkpoint end. id={0} {1}", r, tkey);
             return 0;
         }
 
@@ -317,6 +317,7 @@ namespace Zeze.Transaction
 
         internal override async Task<int> ReduceInvalidAllLocalOnly(int GlobalCacheManagerHashIndex)
         {
+            var remain = new List<(TableKey, Record<K, V>)>(Cache.DataMap.Count);
             foreach (var e in Cache.DataMap)
             {
                 var gkey = EncodeGlobalKey(e.Key);
@@ -327,16 +328,52 @@ namespace Zeze.Transaction
                 }
 
                 var tkey = new TableKey(Id, e.Key);
-                var lockey = await Zeze.Locks.Get(tkey).WriterLockAsync();
+                var lockey = Zeze.Locks.Get(tkey);
+                if (false == lockey.TryEnterWriteLock())
+                {
+                    remain.Add((tkey, e.Value));
+                    continue;
+                }
                 try
                 {
-                    // 只是需要设置Invalid，放弃资源，后面的所有访问都需要重新获取。
-                    e.Value.State = GlobalCacheManagerServer.StateInvalid;
+                    using (await e.Value.Mutex.LockAsync()) // TODO TryLock Need
+                    {
+                        // 只是需要设置Invalid，放弃资源，后面的所有访问都需要重新获取。
+                        e.Value.State = GlobalCacheManagerServer.StateInvalid;
+                        await FlushWhenReduce(e.Value);
+                    }
                 }
                 finally
                 {
-                    lockey.Release();
+                    lockey.Dispose();
                 }
+            }
+            while (remain.Count > 0)
+            {
+                var remain2 = new List<(TableKey, Record<K, V>)>(remain.Count);
+                foreach (var e in remain)
+                {
+                    var lockey = Zeze.Locks.Get(e.Item1);
+                    if (false == lockey.TryEnterWriteLock())
+                    {
+                        remain2.Add(e);
+                        continue;
+                    }
+                    try
+                    {
+                        using (await e.Item2.Mutex.LockAsync()) // TODO TryLock Need
+                        {
+                            // 只是需要设置Invalid，放弃资源，后面的所有访问都需要重新获取。
+                            e.Item2.State = GlobalCacheManagerServer.StateInvalid;
+                            await FlushWhenReduce(e.Item2);
+                        }
+                    }
+                    finally
+                    {
+                        lockey.Dispose();
+                    }
+                }
+                remain = remain2;
             }
             return 0;
         }
@@ -542,42 +579,57 @@ namespace Zeze.Transaction
         /// <returns></returns>
         public async Task<long> WalkAsync(Func<K, V, bool> callback)
         {
+            return await WalkAsync(callback, null);
+        }
+
+        private bool InvokeCallback(byte[] key, byte[] value, Func<K, V, bool> callback)
+        {
+            K k = DecodeKey(ByteBuffer.Wrap(key));
+            var tkey = new TableKey(Id, k);
+            var lockey = Zeze.Locks.Get(tkey);
+            lockey.EnterReadLock();
+            try
+            {
+                var r = Cache.Get(k);
+                if (null != r && r.State != GlobalCacheManagerServer.StateRemoved)
+                {
+                    if (r.State == GlobalCacheManagerServer.StateShare
+                        || r.State == GlobalCacheManagerServer.StateModify)
+                    {
+                        // 拥有正确的状态：
+                        if (r.Value == null)
+                            return true; // 已经被删除，但是还没有checkpoint的记录看不到。
+                        return callback(r.Key, r.ValueTyped);
+                    }
+                    // else GlobalCacheManager.StateInvalid
+                    // 继续后面的处理：使用数据库中的数据。
+                }
+            }
+            finally
+            {
+                lockey.Release();
+            }
+            // 缓存中不存在或者正在被删除，使用数据库中的数据。
+            // 不需要锁。提前释放。
+            V v = DecodeValue(ByteBuffer.Wrap(value));
+            return callback(k, v);
+        }
+
+        public async Task<long> WalkAsync(Func<K, V, bool> callback, Action actionNotLock)
+        {
             if (Transaction.Current != null)
             {
                 throw new Exception("must be called without transaction");
             }
             return await TStorage.TableAsync.WalkAsync(
-                (key, value) =>
+                (key, value) => 
                 {
-                    K k = DecodeKey(ByteBuffer.Wrap(key));
-                    var tkey = new TableKey(Id, k);
-                    var lockey = Zeze.Locks.Get(tkey);
-                    lockey.EnterReadLock();
-                    try
+                    if (InvokeCallback(key, value, callback))
                     {
-                        var r = Cache.Get(k);
-                        if (null != r && r.State != GlobalCacheManagerServer.StateRemoved)
-                        {
-                            if (r.State == GlobalCacheManagerServer.StateShare
-                                || r.State == GlobalCacheManagerServer.StateModify)
-                            {
-                                // 拥有正确的状态：
-                                if (r.Value == null)
-                                    return true; // 已经被删除，但是还没有checkpoint的记录看不到。
-                                return callback(r.Key, r.ValueTyped);
-                            }
-                            // else GlobalCacheManager.StateInvalid
-                            // 继续后面的处理：使用数据库中的数据。
-                        }
+                        actionNotLock?.Invoke();
+                        return true;
                     }
-                    finally
-                    {
-                        lockey.Release();
-                    }
-                    // 缓存中不存在或者正在被删除，使用数据库中的数据。
-                    // 测试不需要锁。提前释放。
-                    V v = DecodeValue(ByteBuffer.Wrap(value));
-                    return callback(k, v);
+                    return false;
                 });
         }
 
@@ -652,6 +704,26 @@ namespace Zeze.Transaction
                     return callback(k, v);
                 });
         }
+
+        public long WalkCacheKey(Func<K, bool> callback)
+        {
+            return Cache.WalkKey(callback);
+        }
+
+        public async Task<long> WalkCacheKeyAsync(Func<K, Task<bool>> callback)
+        {
+            return await Cache.WalkKeyAsync(callback);
+        }
+
+        public async Task<long> WalkDatabaseKeyAsync(Func<K, bool> callback)
+        {
+            return await TStorage.TableAsync.WalkKeyAsync((key) =>
+            {
+                K k = DecodeKey(ByteBuffer.Wrap(key));
+                return callback(k);
+            });
+        }
+
 
         /// <summary>
         /// 获得记录的拷贝。

@@ -18,6 +18,7 @@ import Zeze.Net.Binary;
 import Zeze.Net.Service;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Transaction.Bean;
+import Zeze.Transaction.DatabaseRocksDb;
 import Zeze.Transaction.EmptyBean;
 import Zeze.Transaction.Procedure;
 import Zeze.Transaction.Record;
@@ -30,7 +31,6 @@ import Zeze.Util.ThreadFactoryWithName;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
@@ -48,8 +48,7 @@ public class Test {
 
 	private void LogDump(String db) throws IOException, RocksDBException {
 		RocksDB.loadLibrary();
-		var options = new Options().setCreateIfMissing(true);
-		try (var r1 = RocksDB.open(options, Paths.get(db, "logs").toString())) {
+		try (var r1 = RocksDB.openReadOnly(DatabaseRocksDb.getCommonOptions(), Paths.get(db, "logs").toString())) {
 			try (var it1 = r1.newIterator()) {
 				it1.seekToFirst();
 				var StateMachine = new TestStateMachine();
@@ -98,7 +97,7 @@ public class Test {
 
 		Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
 			try {
-				logger.error("uncaught fatal exception for thread: " + t.getName(), e);
+				logger.error("uncaught fatal exception for thread: {}", t.getName(), e);
 			} catch (Throwable ex) {
 				ex.printStackTrace();
 			} finally {
@@ -221,7 +220,7 @@ public class Test {
 			report.append(String.format("%n%s,Expect=%d,Now=%d,Errors=%s",
 					stepName, expectCount, CurrentCount, GetErrorsString()));
 			report.append(String.format("%n-------------------------------------------"));
-			logger.log(level, report.toString());
+			logger.log(level, "{}", report.toString());
 
 			if (resetExpectCount) {
 				ExpectCount.getAndSet(CurrentCount); // 下一个测试重新开始。
@@ -238,6 +237,7 @@ public class Test {
 		for (int i = 0; i < concurrent; ++i) {
 			try {
 				var req = new AddCount();
+				req.setTimeout(3600_000);
 				tasks.add(Agent.SendForWait(req));
 				// logger.debug("+++++++ {} new AddCount {}", i, req.getUnique().getRequestId());
 				requests.add(req);
@@ -287,7 +287,7 @@ public class Test {
 		for (var test : Rafts.values()) {
 			if (index++ == randIndex) {
 				if (test.Raft != null)
-					test.Raft.getLogSequence().Snapshot(false);
+					test.Raft.getLogSequence().Snapshot();
 				return;
 			}
 		}
@@ -520,7 +520,7 @@ public class Test {
 					fa.Action.run();
 					fa.Count++;
 				} catch (Throwable ex) {
-					logger.error("FailAction " + fa.Name, ex);
+					logger.error("FailAction {}", fa.Name, ex);
 					System.out.println("___________________________________________");
 					System.out.println("___________________________________________");
 					System.out.println("___________________________________________");
@@ -534,7 +534,6 @@ public class Test {
 							raft.Raft.getLogSequence().Close();
 						}
 					}
-					LogManager.shutdown();
 					System.exit(-1);
 					/*
 					for (var raft : Rafts.Values)
@@ -700,17 +699,16 @@ public class Test {
 
 		@Override
 		public void LoadSnapshot(String path) throws IOException {
-			synchronized (getRaft()) {
-				_LoadSnapshot(path);
-				logger.info("{} LoadSnapshot Count={}", getRaft().getName(), Count);
-			}
+			_LoadSnapshot(path);
+			logger.info("{} LoadSnapshot Count={}", getRaft().getName(), Count);
 		}
 
 		// 这里没有处理重入，调用者需要保证。
 		@Override
 		public SnapshotResult Snapshot(String path) throws IOException, RocksDBException {
 			SnapshotResult result = new SnapshotResult();
-			synchronized (getRaft()) {
+			getRaft().lock();
+			try {
 				if (getRaft().getLogSequence() != null) {
 					var lastAppliedLog = getRaft().getLogSequence().LastAppliedLogTermIndex();
 					if (lastAppliedLog != null) {
@@ -726,6 +724,8 @@ public class Test {
 						result.success = true;
 					}
 				}
+			} finally {
+				getRaft().unlock();
 			}
 			return result;
 		}
@@ -787,15 +787,13 @@ public class Test {
 			}
 		}
 
-		public void StopRaft() throws Throwable {
-			synchronized (this) {
-				logger.debug("Raft {} Stop ...", RaftName);
-				// 在同一个进程中，没法模拟进程退出，
-				// 此时RocksDb应该需要关闭，否则重启会失败吧。
-				if (Raft != null) {
-					Raft.Shutdown();
-					Raft = null;
-				}
+		public synchronized void StopRaft() throws Throwable {
+			logger.debug("Raft {} Stop ...", RaftName);
+			// 在同一个进程中，没法模拟进程退出，
+			// 此时RocksDb应该需要关闭，否则重启会失败吧。
+			if (Raft != null) {
+				Raft.Shutdown();
+				Raft = null;
 			}
 		}
 
@@ -803,45 +801,42 @@ public class Test {
 			StartRaft(false);
 		}
 
-		public void StartRaft(boolean resetLog) throws Throwable {
-			synchronized (this) {
-				if (Raft != null) {
-					Raft.getServer().Start();
-					return;
-				}
-				logger.debug("Raft {} Start ...", RaftName);
-				StateMachine = new TestStateMachine();
-
-				var raftConfig = RaftConfig.Load(RaftConfigFileName);
-				raftConfig.setSnapshotMinLogCount(10);
-				raftConfig.setUniqueRequestExpiredDays(1);
-				raftConfig.setDbHome(Paths.get(RaftName.replace(':', '_')).toString());
-				if (resetLog) {
-					logger.warn("------------------------------------------------");
-					logger.warn("- Reset Log {} -", raftConfig.getDbHome());
-					logger.warn("------------------------------------------------");
-					// 只删除日志相关数据库。保留重复请求数据库。
-					var logsDir = Paths.get(raftConfig.getDbHome(), "logs").toString();
-					if (new File(logsDir).isDirectory())
-						LogSequence.deleteDirectory(new File(logsDir));
-					var raftsDir = Paths.get(raftConfig.getDbHome(), "rafts").toString();
-					if (new File(raftsDir).isDirectory())
-						LogSequence.deleteDirectory(new File(raftsDir));
-					var snapshotFile = Paths.get(raftConfig.getDbHome(), "snapshot.dat").toString();
-					if ((new File(snapshotFile)).isFile())
-						//noinspection ResultOfMethodCallIgnored
-						(new File(snapshotFile)).delete();
-				}
-				Files.createDirectories(Paths.get(raftConfig.getDbHome()));
-
-				Raft = new Raft(StateMachine, RaftName, raftConfig);
-				Raft.getLogSequence().getWriteOptions().setSync(false);
-				Raft.getServer().AddFactoryHandle(AddCount.TypeId_,
-						new Service.ProtocolFactoryHandle<>(AddCount::new, this::ProcessAddCount));
-				Raft.getServer().AddFactoryHandle(GetCount.TypeId_,
-						new Service.ProtocolFactoryHandle<>(GetCount::new, this::ProcessGetCount));
+		public synchronized void StartRaft(boolean resetLog) throws Throwable {
+			if (Raft != null) {
 				Raft.getServer().Start();
+				return;
 			}
+			logger.debug("Raft {} Start ...", RaftName);
+			StateMachine = new TestStateMachine();
+
+			var raftConfig = RaftConfig.Load(RaftConfigFileName);
+			raftConfig.setUniqueRequestExpiredDays(1);
+			raftConfig.setDbHome(Paths.get(RaftName.replace(':', '_')).toString());
+			if (resetLog) {
+				logger.warn("------------------------------------------------");
+				logger.warn("- Reset Log {} -", raftConfig.getDbHome());
+				logger.warn("------------------------------------------------");
+				// 只删除日志相关数据库。保留重复请求数据库。
+				var logsDir = Paths.get(raftConfig.getDbHome(), "logs").toString();
+				if (new File(logsDir).isDirectory())
+					LogSequence.deleteDirectory(new File(logsDir));
+				var raftsDir = Paths.get(raftConfig.getDbHome(), "rafts").toString();
+				if (new File(raftsDir).isDirectory())
+					LogSequence.deleteDirectory(new File(raftsDir));
+				var snapshotFile = Paths.get(raftConfig.getDbHome(), "snapshot.dat").toString();
+				if ((new File(snapshotFile)).isFile())
+					//noinspection ResultOfMethodCallIgnored
+					(new File(snapshotFile)).delete();
+			}
+			Files.createDirectories(Paths.get(raftConfig.getDbHome()));
+
+			Raft = new Raft(StateMachine, RaftName, raftConfig);
+			Raft.getLogSequence().setWriteOptions(DatabaseRocksDb.getDefaultWriteOptions());
+			Raft.getServer().AddFactoryHandle(AddCount.TypeId_,
+					new Service.ProtocolFactoryHandle<>(AddCount::new, this::ProcessAddCount));
+			Raft.getServer().AddFactoryHandle(GetCount.TypeId_,
+					new Service.ProtocolFactoryHandle<>(GetCount::new, this::ProcessGetCount));
+			Raft.getServer().Start();
 		}
 
 		private long ProcessAddCount(AddCount r) {

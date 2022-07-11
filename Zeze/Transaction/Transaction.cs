@@ -17,22 +17,12 @@ namespace Zeze.Transaction
 
         private static readonly AsyncLocal<Transaction> asyncLocal = new();
 
-        public static Transaction Current
-        {
-            get
-            {
-                var tmp = asyncLocal.Value;
-                if (null == tmp)
-                    return null;
-                return tmp.Created ? tmp : null;
-            }
-        }
+        public static Transaction Current => asyncLocal.Value;
+
         // 嵌套存储过程栈。
         public List<Procedure> ProcedureStack { get; } = new List<Procedure>();
 
         public Procedure TopProcedure => ProcedureStack.Count == 0 ? null : ProcedureStack[^1];
-
-        private bool Created = true;
 
         /*
         private void ReuseTransaction()
@@ -152,6 +142,16 @@ namespace Zeze.Transaction
 
         private List<Action> LastRollbackActions;
 
+        public static void WhileRollback(Action action)
+        {
+            Current.RunWhileRollback(action);
+        }
+
+        public static void WhileCommit(Action action)
+        {
+            Current.RunWhileCommit(action);
+        }
+
         public void RunWhileCommit(Action action)
         {
             VerifyRunning();
@@ -164,8 +164,6 @@ namespace Zeze.Transaction
             Savepoints[^1].RollbackActions.Add(action);
         }
 
-        internal TableKey LastTableKeyOfRedoAndRelease { get; set; } = null;
-        internal long LastGlobalSerialIdOfRedoAndRelease { get; set; } = 0;
         private bool AlwaysReleaseLockWhenRedo = false;
         internal void SetAlwaysReleaseLockWhenRedo()
         {
@@ -185,7 +183,10 @@ namespace Zeze.Transaction
                 for (int tryCount = 0; tryCount < 256; ++tryCount) // 最多尝试次数
                 {
                     // 默认在锁内重复尝试，除非CheckResult.RedoAndReleaseLock，否则由于CheckResult.Redo保持锁会导致死锁。
-                    procedure.Zeze.Checkpoint.EnterFlushReadLock();
+                    var checkpoint = procedure.Zeze.Checkpoint;
+                    if (checkpoint == null)
+                        return Procedure.Closed;
+                    checkpoint.EnterFlushReadLock();
                     try
                     {
                         for (/* out loop */; tryCount < 256; ++tryCount) // 最多尝试次数
@@ -193,12 +194,12 @@ namespace Zeze.Transaction
                             CheckResult checkResult = CheckResult.Redo; // 用来决定是否释放锁，除非 _lock_and_check_ 明确返回需要释放锁，否则都不释放。
                             try
                             {
-                                LastTableKeyOfRedoAndRelease = null;
                                 var result = await procedure.CallAsync();
                                 switch (State)
                                 {
                                     case TransactionState.Running:
-                                        if ((result == Procedure.Success && Savepoints.Count != 1) || (result != Procedure.Success && Savepoints.Count != 0))
+                                        if ((result == Procedure.Success && Savepoints.Count != 1)
+                                            || (result != Procedure.Success && Savepoints.Count != 0))
                                         {
                                             // 这个错误不应该重做
                                             logger.Fatal("Transaction.Perform:{0}. savepoints.Count != 1.", procedure);
@@ -315,11 +316,12 @@ namespace Zeze.Transaction
                     }
                     finally
                     {
-                        procedure.Zeze.Checkpoint.ExitFlushReadLock();
+                        checkpoint.ExitFlushReadLock();
                     }
                     //logger.Debug("Checkpoint.WaitRun {0}", procedure);
-                    if (null != LastTableKeyOfRedoAndRelease)
-                        await procedure.Zeze.TryWaitFlushWhenReduce(LastTableKeyOfRedoAndRelease, LastGlobalSerialIdOfRedoAndRelease);
+
+                    // 实现Fresh队列以后删除Sleep。
+                    Thread.Sleep(Util.Random.Instance.Next(80) + 20);
                 }
                 logger.Error("Transaction.Perform:{0}. too many try.", procedure);
                 FinalRollback(procedure);
@@ -346,6 +348,13 @@ namespace Zeze.Transaction
                 catch (Exception e)
                 {
                     logger.Error(e, "Commit Procedure {0} Action {1}", procedure, action.Method.Name);
+#if DEBUG
+                    // 对于 unit test 的异常特殊处理，与unit test框架能搭配工作
+                    if (e.GetType().Name == "AssertFailedException")
+                    {
+                        throw;
+                    }
+#endif
                 }
             }
         }
@@ -362,6 +371,7 @@ namespace Zeze.Transaction
                     lastsp.Commit();
                     foreach (var e in AccessedRecords)
                     {
+                        e.Value.Origin.SetNotFresh();
                         if (e.Value.Dirty)
                         {
                             e.Value.Origin.Commit(e.Value);
@@ -412,6 +422,11 @@ namespace Zeze.Transaction
 
         private void FinalRollback(Procedure procedure)
         {
+            foreach (var e in AccessedRecords)
+            {
+                e.Value.Origin.SetNotFresh();
+            }
+            Savepoints.Clear(); // 这里可以安全的清除日志，这样如果 rollback_action 需要读取数据，将读到原始的。
             State = TransactionState.Completed;
             if (null != LastRollbackActions)
             {
@@ -569,8 +584,6 @@ namespace Zeze.Transaction
                             return CheckResult.Redo;
 
                         case GlobalCacheManagerServer.StateInvalid:
-                            LastTableKeyOfRedoAndRelease = e.TableKey;
-                            LastGlobalSerialIdOfRedoAndRelease = e.Origin.LastErrorGlobalSerialId;
                             return CheckResult.RedoAndReleaseLock; // 写锁发现Invalid，肯定有Reduce请求。
 
                         case GlobalCacheManagerServer.StateModify:
@@ -580,15 +593,12 @@ namespace Zeze.Transaction
                         case GlobalCacheManagerServer.StateShare:
                             // 这里可能死锁：另一个先获得提升的请求要求本机Reduce，但是本机Checkpoint无法进行下去，被当前事务挡住了。
                             // 通过 GlobalCacheManager 检查死锁，返回失败;需要重做并释放锁。
-                            var (_, ResultState, ResultGlobalSerialId) = await e.Origin.Acquire(GlobalCacheManagerServer.StateModify);
+                            var (_, ResultState) = await e.Origin.Acquire(GlobalCacheManagerServer.StateModify, e.Origin.fresh);
                             if (ResultState  != GlobalCacheManagerServer.StateModify)
                             {
+                                e.Origin.SetNotFresh(); // 抢失败不再新鲜。
                                 logger.Warn("Acquire Failed. Maybe DeadLock Found {0}", e.Origin);
                                 e.Origin.State = GlobalCacheManagerServer.StateInvalid;
-                                LastTableKeyOfRedoAndRelease = e.TableKey;
-                                e.Origin.LastErrorGlobalSerialId = ResultGlobalSerialId; // save
-                                LastGlobalSerialIdOfRedoAndRelease = ResultGlobalSerialId;
-
                                 return CheckResult.RedoAndReleaseLock;
                             }
                             e.Origin.State = GlobalCacheManagerServer.StateModify;
@@ -607,8 +617,6 @@ namespace Zeze.Transaction
 
                         case GlobalCacheManagerServer.StateInvalid:
                             // 发现Invalid，肯定有Reduce请求或者被Cache清理，此时保险起见释放锁。
-                            LastTableKeyOfRedoAndRelease = e.TableKey;
-                            LastGlobalSerialIdOfRedoAndRelease = e.Origin.LastErrorGlobalSerialId;
                             return CheckResult.RedoAndReleaseLock;
                     }
                     return e.Timestamp != e.Origin.Timestamp
@@ -726,8 +734,23 @@ namespace Zeze.Transaction
                         // 重新从当前 e 继续锁。
                         continue;
                     }
-                    // else 已经持有读锁，不可能被修改也不可能降级(reduce)，所以不做检测了。                    
-                    // 已经锁定了，跳过当前锁，比较下一个。
+                    // BUG 即使锁内。Record.Global.State 可能没有提升到需要水平。需要重新_check_。
+                    var checkResult = await Check(e.Value.Dirty, e.Value);
+                    switch (checkResult)
+                    {
+                        case CheckResult.Success:
+                            // 已经锁内，所以肯定不会冲突，多数情况是这个。
+                            break;
+
+                        case CheckResult.Redo:
+                            // Impossible!
+                            conflict = true;
+                            break; // continue lock
+
+                        case CheckResult.RedoAndReleaseLock:
+                            // _check_可能需要到Global提升状态，这里可能发生GLOBAL-DEAD-LOCK。
+                            return CheckResult.RedoAndReleaseLock;
+                    }
                     ++index;
                     hasNext = itar.MoveNext();
                     continue;

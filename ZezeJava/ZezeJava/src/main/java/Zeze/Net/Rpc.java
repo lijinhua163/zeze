@@ -194,44 +194,26 @@ public abstract class Rpc<TArgument extends Bean, TResult extends Bean> extends 
 			throw new IllegalStateException(String.format("Rpc Invalid ResultCode=%d %s", getResultCode(), this));
 	}
 
-	public void SendResult() {
-		SendResult(null);
-	}
-
+	@Override
 	public void SendResult(Binary result) {
 		if (SendResultDone) {
-			logger.log(getService().getSocketOptions().getSocketLogLevel(), "Rpc.SendResult Done {} {}",
-					getSender().getSocket(), this);
+			logger.error("Rpc.SendResult Already Done: {} {}", getSender(), this, new Exception());
 			return;
 		}
 		SendResultDone = true;
-
 		ResultEncoded = result;
 		IsRequest = false;
-		if (!super.Send(getSender())) {
-			logger.log(getService().getSocketOptions().getSocketLogLevel(), "Rpc.SendResult Failed {} {}",
-					getSender().getSocket(), this);
-		}
+		if (!super.Send(getSender()))
+			logger.warn("Rpc.SendResult Failed: {} {}", getSender(), this);
 	}
 
 	@Override
-	public void SendResultCode(long code) {
-		SendResultCode(code, null);
-	}
-
-	@Override
-	public void SendResultCode(long code, Binary result) {
+	public boolean trySendResultCode(long code) {
 		if (SendResultDone)
-			return;
-		SendResultDone = true;
-
-		ResultEncoded = result;
+			return false;
 		setResultCode(code);
-		IsRequest = false;
-		if (!super.Send(getSender())) {
-			logger.log(getService().getSocketOptions().getSocketLogLevel(), "Rpc.SendResult Failed {} {}",
-					getSender().getSocket(), this);
-		}
+		SendResult(null);
+		return true;
 	}
 
 	@Override

@@ -7,6 +7,7 @@ import Zeze.Builtin.Provider.BModule;
 import Zeze.Builtin.Provider.Dispatch;
 import Zeze.Builtin.Provider.Kick;
 import Zeze.Net.AsyncSocket;
+import Zeze.Net.Rpc;
 import Zeze.Services.ServiceManager.Agent;
 import Zeze.Services.ServiceManager.SubscribeInfo;
 import Zeze.Transaction.Procedure;
@@ -21,25 +22,22 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 
 	public ProviderApp ProviderApp;
 
-	void ApplyOnChanged(Agent.SubscribeState subState) {
+	void ApplyOnChanged(Agent.SubscribeState subState) throws Throwable {
 		if (subState.getServiceName().equals(ProviderApp.LinkdServiceName)) {
+			// Linkd info
 			ProviderApp.ProviderService.Apply(subState.getServiceInfos());
+		} else if (subState.getServiceName().startsWith(ProviderApp.ServerServiceNamePrefix)) {
+			// Provider info
+			// 对于 SubscribeTypeSimple 是不需要 SetReady 的，为了能一致处理，就都设置上了。
+			// 对于 SubscribeTypeReadyCommit 在 ApplyOnPrepare 中处理。
+			if (subState.getSubscribeType() == SubscribeInfo.SubscribeTypeSimple)
+				this.ProviderApp.ProviderDirectService.TryConnectAndSetReady(subState, subState.getServiceInfos());
 		}
-		/*
-		else if (subState.getServiceName().startsWith(ProviderApp.ServerServiceNamePrefix)){
-			System.out.println("ServerId=" + ProviderApp.Zeze.getConfig().getServerId()
-			+ " OnChanged=" + subState.getServiceInfos());
-			//this.ProviderApp.ProviderDirectService.TryConnectAndSetReady(subState, subState.getServiceInfos());
-		}
-		*/
 	}
 
-	void ApplyOnPrepare(Agent.SubscribeState subState) {
+	void ApplyOnPrepare(Agent.SubscribeState subState) throws Throwable {
 		var pending = subState.getServiceInfosPending();
-		if (pending == null)
-			return;
-
-		if (pending.getServiceName().startsWith(ProviderApp.ServerServiceNamePrefix)) {
+		if (pending != null && pending.getServiceName().startsWith(ProviderApp.ServerServiceNamePrefix)) {
 			this.ProviderApp.ProviderDirectService.TryConnectAndSetReady(subState, pending);
 		}
 	}
@@ -101,8 +99,21 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 
 			var session = new ProviderUserSession(ProviderApp.ProviderService, p.Argument.getAccount(),
 					p.Argument.getContext(), p.getSender(), p.Argument.getLinkSid());
-
 			p2.setUserState(session);
+
+			if (AsyncSocket.ENABLE_PROTOCOL_LOG) {
+				if (p2.isRequest()) {
+					if (p2 instanceof Rpc)
+						AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "DISP[{}] {}({}): {}", p.Argument.getLinkSid(),
+								p2.getClass().getSimpleName(), ((Rpc<?, ?>)p2).getSessionId(), p2.Argument);
+					else
+						AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "DISP[{}] {}: {}", p.Argument.getLinkSid(),
+								p2.getClass().getSimpleName(), p2.Argument);
+				} else
+					AsyncSocket.logger.log(AsyncSocket.LEVEL_PROTOCOL_LOG, "DISP[{}] {}({})>{} {}", p.Argument.getLinkSid(),
+							p2.getClass().getSimpleName(), ((Rpc<?, ?>)p2).getSessionId(), p2.getResultCode(), p2.getResultBean());
+			}
+
 			Transaction txn = Transaction.getCurrent();
 			if (txn != null) {
 				// 已经在事务中，嵌入执行。此时忽略p2的NoProcedure配置。
@@ -134,7 +145,7 @@ public abstract class ProviderImplement extends AbstractProviderImplement {
 					});
 		} catch (Throwable ex) {
 			SendKick(p.getSender(), p.Argument.getLinkSid(), BKick.ErrorProtocolException, ex.toString());
-			logger.error(ex);
+			logger.error("", ex);
 			return Procedure.Success;
 		}
 	}

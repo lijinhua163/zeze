@@ -1,7 +1,6 @@
 ﻿using System;
 using System.IO;
 using Zeze.Gen.Types;
-using Zeze.Serialize;
 
 namespace Zeze.Gen.cs
 {
@@ -22,6 +21,9 @@ namespace Zeze.Gen.cs
                 sw.WriteLine(prefix + "    int _i_ = 0;");
             foreach (Variable v in bean.Variables)
             {
+                if (v.Transient)
+                    continue;
+
                 sw.WriteLine(prefix + "    {");
                 v.VariableType.Accept(new Encode(varNameUpper ? v.NameUpper1 : v.Name, v.Id, "_o_", sw, prefix + "        ", v.NameUpper1));
                 sw.WriteLine(prefix + "    }");
@@ -45,6 +47,9 @@ namespace Zeze.Gen.cs
                 sw.WriteLine(prefix + "    int _i_ = 0;");
             foreach (Variable v in bean.Variables)
             {
+                if (v.Transient)
+                    continue;
+
                 sw.WriteLine(prefix + "    {");
                 v.VariableType.Accept(new Encode(v.NamePrivate, v.Id, "_o_", sw, prefix + "        ", v.NameUpper1));
                 sw.WriteLine(prefix + "    }");
@@ -241,6 +246,16 @@ namespace Zeze.Gen.cs
             if (id <= 0)
                 throw new Exception("invalid variable.id");
             Types.Type vt = type.ValueType;
+            if (type.Variable.Type == "array" && vt is TypeByte)
+            {
+                sw.WriteLine(prefix + "var _x_ = " + varname + ';');
+                sw.WriteLine(prefix + "if (_x_ != null && _x_.Length != 0)");
+                sw.WriteLine(prefix + "{");
+                sw.WriteLine(prefix + "    _i_ = " + bufname + ".WriteTag(_i_, " + id + ", ByteBuffer.BYTES);");
+                sw.WriteLine(prefix + "    " + bufname + ".WriteBytes(_x_);");
+                sw.WriteLine(prefix + "}");
+                return;
+            }
             bool isFixSizeList = type is TypeList list && list.FixSize >= 0 || type.Variable.Type == "array";
             sw.WriteLine(prefix + "var _x_ = " + varname + ';');
             if (type.Variable.Type == "array")

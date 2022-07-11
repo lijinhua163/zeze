@@ -49,6 +49,7 @@ public final class Simulate {
 
 	@After
 	public void After() throws Throwable {
+		logger.fatal("After");
 		for (var app : Apps)
 			app.Stop();
 		Apps.clear();
@@ -57,26 +58,33 @@ public final class Simulate {
 	@Test
 	public void testMain() throws Throwable {
 		logger.fatal("Prepare");
-		Tasks.prepare();
-		do {
-			++BatchNumber;
-			logger.fatal("Run {}", BatchNumber);
-			for (int i = 0; i < BatchTaskCount; i++)
-				Tasks.randCreateTask().Run();
-			logger.fatal("Wait {}", BatchNumber);
-			for (var app : Apps) {
-				app.WaitAllRunningTasksAndClear();
-				logger.fatal("Finish {}-{}", BatchNumber, app.getServerId());
-			}
-			logger.fatal("Verify {}", BatchNumber);
-			Tasks.verify();
-		} while (Infinite);
+		try {
+			Tasks.prepare();
+			do {
+				++BatchNumber;
+				logger.fatal("Run {}", BatchNumber);
+				for (int i = 0; i < BatchTaskCount; i++)
+					Tasks.randCreateTask().Run();
+				logger.fatal("Wait {}", BatchNumber);
+				for (var app : Apps) {
+					app.WaitAllRunningTasksAndClear();
+					logger.fatal("Finish {}-{}", BatchNumber, app.getServerId());
+				}
+				logger.fatal("Verify {}", BatchNumber);
+				//noinspection BusyWait
+				Thread.sleep(4000);
+				Tasks.verify();
+			} while (Infinite);
+		} catch (Exception ex) {
+			logger.error("", ex);
+			throw ex;
+		}
 		logger.fatal("Done!!!!!!");
 	}
 
 	public static void main(String[] args) throws Throwable {
 		var simulate = new Simulate();
-		simulate.Infinite = args.length > 0 && args[0].equalsIgnoreCase("infinite"); // 一直执行。
+		simulate.Infinite = true;
 		simulate.Before();
 		try {
 			simulate.testMain();

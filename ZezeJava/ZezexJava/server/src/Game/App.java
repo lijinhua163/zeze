@@ -12,7 +12,7 @@ import Zeze.Game.ProviderDirectWithTransmit;
 import Zeze.Game.ProviderImplementWithOnline;
 import Zeze.Net.AsyncSocket;
 import Zeze.Util.PersistentAtomicLong;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.tikv.shade.com.fasterxml.jackson.databind.ObjectMapper;
 
 public final class App extends Zeze.AppBase {
 	public static final App Instance = new App();
@@ -104,10 +104,12 @@ public final class App extends Zeze.AppBase {
 	}
 
 	public void Stop() throws Throwable {
-		Provider.Online.Stop();
+		if (Provider != null && Provider.Online != null)
+			Provider.Online.Stop();
 		StopService(); // 关闭网络
 		StopModules(); // 关闭模块，卸载配置什么的。
-		Zeze.Stop(); // 关闭数据库
+		if (Zeze != null)
+			Zeze.Stop(); // 关闭数据库
 		DestroyModules();
 		DestroyServices();
 		DestroyZeze();

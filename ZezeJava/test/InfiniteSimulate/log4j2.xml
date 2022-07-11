@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<configuration status="WARN" monitorInterval="30">
+<configuration status="WARN" monitorInterval="30" shutdownHook="disable">
 	<Properties>
 		<Property name="path">.</Property>
 		<Property name="name">${sys:logname:-zeze}</Property>
@@ -16,6 +16,7 @@
 			<Policies>
 				<SizeBasedTriggeringPolicy size="100 MB" />
 			</Policies>
+			<DefaultRolloverStrategy max="1000"/>
 		</RollingFile>
 
 		<RollingFile name="ErrorLog" fileName="${path}/${name}_error${ext}" filePattern="${path}/${name}_error.%d{yy-MM-dd}-%i${ext}">
@@ -24,6 +25,7 @@
 			<Policies>
 				<SizeBasedTriggeringPolicy size="100 MB" />
 			</Policies>
+			<DefaultRolloverStrategy max="1000"/>
 		</RollingFile>
 	</appenders>
 
@@ -31,7 +33,7 @@
 		<logger name="org" level="INFO" />
 		<logger name="io.netty" level="INFO" />
 
-		<root level="TRACE">
+		<root level="INFO">
 			<appender-ref ref="Console" />
 			<appender-ref ref="AllLog" />
 			<appender-ref ref="ErrorLog" />

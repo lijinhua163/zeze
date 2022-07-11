@@ -12,15 +12,17 @@ import Zeze.Net.Binary;
 import Zeze.Net.Protocol;
 import Zeze.Net.ProtocolHandle;
 import Zeze.Net.Rpc;
+import Zeze.Net.RpcTimeoutException;
 import Zeze.Net.Selectors;
 import Zeze.Net.Service;
 import Zeze.Raft.RaftConfig;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Services.GlobalCacheManager.Acquire;
 import Zeze.Services.GlobalCacheManager.Cleanup;
+import Zeze.Services.GlobalCacheManager.KeepAlive;
 import Zeze.Services.GlobalCacheManager.Login;
 import Zeze.Services.GlobalCacheManager.NormalClose;
-import Zeze.Services.GlobalCacheManager.Param2;
+import Zeze.Services.GlobalCacheManager.GlobalKeyState;
 import Zeze.Services.GlobalCacheManager.ReLogin;
 import Zeze.Services.GlobalCacheManager.Reduce;
 import Zeze.Util.Action0;
@@ -29,28 +31,24 @@ import Zeze.Util.AsyncLock;
 import Zeze.Util.IdentityHashSet;
 import Zeze.Util.KV;
 import Zeze.Util.LongConcurrentHashMap;
+import Zeze.Util.OutObject;
 import Zeze.Util.Task;
 import Zeze.Util.ThreadFactoryWithName;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.LoggerContext;
-import org.w3c.dom.Element;
 
 public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerConst {
 	static {
 		System.setProperty("log4j.configurationFile", "log4j2.xml");
-		var levelProp = System.getProperty("logLevel");
-		var level = Level.INFO;
-		if ("trace".equalsIgnoreCase(levelProp))
-			level = Level.TRACE;
-		else if ("debug".equalsIgnoreCase(levelProp))
-			level = Level.DEBUG;
+		var level = Level.toLevel(System.getProperty("logLevel"), Level.INFO);
 		((LoggerContext)LogManager.getContext(false)).getConfiguration().getRootLogger().setLevel(level);
 	}
 
 	private static final boolean ENABLE_PERF = true;
 	private static final Logger logger = LogManager.getLogger(GlobalCacheManagerAsyncServer.class);
+	private static final boolean isDebugEnabled = logger.isDebugEnabled();
 	private static final GlobalCacheManagerAsyncServer Instance = new GlobalCacheManagerAsyncServer();
 
 	public static GlobalCacheManagerAsyncServer getInstance() {
@@ -72,32 +70,16 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 	 * 简化实现。
 	 */
 	private LongConcurrentHashMap<CacheHolder> Sessions;
-	private final GCMConfig Config = new GCMConfig();
+	private final GlobalCacheManagerServer.GCMConfig Config = new GlobalCacheManagerServer.GCMConfig();
+	private AchillesHeelConfig AchillesHeelConfig;
 	private GlobalCacheManagerPerf perf;
 
-	private static final class GCMConfig implements Zeze.Config.ICustomize {
-		// 设置了这么大，开始使用后，大概会占用700M的内存，作为全局服务器，先这么大吧。
-		// 尽量不重新调整ConcurrentHashMap。
-		private int InitialCapacity = 10_000_000;
-
-		@Override
-		public String getName() {
-			return "GlobalCacheManager";
-		}
-
-		int getInitialCapacity() {
-			return InitialCapacity;
-		}
-
-		@Override
-		public void Parse(Element self) {
-			var attr = self.getAttribute("InitialCapacity");
-			if (!attr.isBlank())
-				InitialCapacity = Math.max(Integer.parseInt(attr), 31);
-		}
+	private GlobalCacheManagerAsyncServer() {
 	}
 
-	private GlobalCacheManagerAsyncServer() {
+	// 外面主动提供装载配置，需要在Load之前把这个实例注册进去。
+	public GlobalCacheManagerServer.GCMConfig getConfig() {
+		return Config;
 	}
 
 	public void Start(InetAddress ipaddress, int port) throws Throwable {
@@ -109,13 +91,13 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			return;
 
 		if (ENABLE_PERF)
-			perf = new GlobalCacheManagerPerf(SerialIdGenerator);
+			perf = new GlobalCacheManagerPerf("", SerialIdGenerator);
 
 		if (config == null)
 			config = new Zeze.Config().AddCustomize(Config).LoadAndParse();
 
 		Sessions = new LongConcurrentHashMap<>(4096);
-		global = new ConcurrentHashMap<>(Config.getInitialCapacity());
+		global = new ConcurrentHashMap<>(Config.InitialCapacity);
 
 		Server = new ServerService(config);
 
@@ -138,7 +120,38 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 		Server.AddFactoryHandle(Cleanup.TypeId_,
 				new Service.ProtocolFactoryHandle<>(Cleanup::new, this::ProcessCleanup));
 
+		Server.AddFactoryHandle(KeepAlive.TypeId_,
+				new Service.ProtocolFactoryHandle<>(KeepAlive::new, this::ProcessKeepAliveRequest));
+
 		ServerSocket = Server.NewServerSocket(ipaddress, port, null);
+
+		// Global的守护不需要独立线程。当出现异常问题不能工作时，没有释放锁是不会造成致命问题的。
+		AchillesHeelConfig = new AchillesHeelConfig(Config.MaxNetPing, Config.ServerProcessTime, Config.ServerReleaseTimeout);
+		Task.schedule(5000, 5000, this::AchillesHeelDaemon);
+	}
+
+	private void AchillesHeelDaemon() {
+		var now = System.currentTimeMillis();
+
+		Sessions.forEach(session -> {
+			if (now - session.getActiveTime() > AchillesHeelConfig.GlobalDaemonTimeout) {
+				//noinspection SynchronizationOnLocalVariableOrMethodParameter
+				synchronized (session) {
+					session.kick();
+					if (!session.Acquired.isEmpty()) {
+						logger.info("AchillesHeelDaemon.Release begin {}", session);
+						var allReleaseFuture = new CountDownFuture();
+						for (var k : session.Acquired.keySet()) {
+							// ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
+							ReleaseAsync(session, k, allReleaseFuture.createOne());
+						}
+						session.setActiveTime(System.currentTimeMillis());
+						logger.info("AchillesHeelDaemon.Release end {}", session);
+						// skip allReleaseFuture result
+					}
+				}
+			}
+		});
 	}
 
 	public synchronized void Stop() throws Throwable {
@@ -155,8 +168,13 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 	 * 手动Cleanup时，连接正确的服务器执行。
 	 */
 	private long ProcessCleanup(Cleanup rpc) {
+		logger.info("ProcessCleanup: {} RequestId={} {}", rpc.getSender(), rpc.getSessionId(), rpc.Argument);
+		if (AchillesHeelConfig != null) // disable cleanup.
+			return 0;
+
 		// 安全性以后加强。
 		if (!rpc.Argument.SecureKey.equals("Ok! verify secure.")) {
+			logger.warn("ProcessCleanup: {} RequestId={} result={}", rpc.getSender(), rpc.getSessionId(), CleanupErrorSecureKey);
 			rpc.SendResultCode(CleanupErrorSecureKey);
 			return 0;
 		}
@@ -164,12 +182,14 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 		var session = Sessions.computeIfAbsent(rpc.Argument.ServerId, __ -> new CacheHolder());
 		if (session.GlobalCacheManagerHashIndex != rpc.Argument.GlobalCacheManagerHashIndex) {
 			// 多点验证
+			logger.warn("ProcessCleanup: {} RequestId={} result={}", rpc.getSender(), rpc.getSessionId(), CleanupErrorGlobalCacheManagerHashIndex);
 			rpc.SendResultCode(CleanupErrorGlobalCacheManagerHashIndex);
 			return 0;
 		}
 
 		if (Server.GetSocket(session.SessionId) != null) {
 			// 连接存在，禁止cleanup。
+			logger.warn("ProcessCleanup: {} RequestId={} result={}", rpc.getSender(), rpc.getSessionId(), CleanupErrorHasConnection);
 			rpc.SendResultCode(CleanupErrorHasConnection);
 			return 0;
 		}
@@ -179,9 +199,9 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 		// XXX verify danger
 		Task.schedule(5 * 60 * 1000, () -> { // delay 5 mins
 			var allReleaseFuture = new CountDownFuture();
-			for (var e : session.Acquired.entrySet()) {
+			for (var k : session.Acquired.keySet()) {
 				// ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
-				ReleaseAsync(session, e.getKey(), allReleaseFuture.createOne());
+				ReleaseAsync(session, k, allReleaseFuture.createOne());
 			}
 			allReleaseFuture.then(__ -> rpc.SendResultCode(0));
 		});
@@ -190,67 +210,89 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 	}
 
 	private long ProcessLogin(Login rpc) throws Throwable {
-		logger.debug("ProcessLogin: {}", rpc);
+		logger.info("ProcessLogin: {} RequestId={} {}", rpc.getSender(), rpc.getSessionId(), rpc.Argument);
 		var session = Sessions.computeIfAbsent(rpc.Argument.ServerId, __ -> new CacheHolder());
-		if (!session.TryBindSocket(rpc.getSender(), rpc.Argument.GlobalCacheManagerHashIndex)) {
+		if (!session.TryBindSocket(rpc.getSender(), rpc.Argument.GlobalCacheManagerHashIndex, true)) {
 			rpc.SendResultCode(LoginBindSocketFail);
 			return 0;
 		}
+		session.setActiveTime(System.currentTimeMillis());
 		// new login, 比如逻辑服务器重启。release old acquired.
 		var allReleaseFuture = new CountDownFuture();
-		for (var e : session.Acquired.entrySet()) {
+		for (var k : session.Acquired.keySet()) {
 			// ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
-			ReleaseAsync(session, e.getKey(), allReleaseFuture.createOne());
+			ReleaseAsync(session, k, allReleaseFuture.createOne());
 		}
+		rpc.Result.MaxNetPing = Config.MaxNetPing;
+		rpc.Result.ServerProcessTime = Config.ServerProcessTime;
+		rpc.Result.ServerReleaseTimeout = Config.ServerReleaseTimeout;
 		allReleaseFuture.then(__ -> rpc.SendResultCode(0));
 		return 0;
 	}
 
 	private long ProcessReLogin(ReLogin rpc) {
-		logger.debug("ProcessReLogin: {}", rpc);
+		logger.info("ProcessReLogin: {} RequestId={} {}", rpc.getSender(), rpc.getSessionId(), rpc.Argument);
 		var session = Sessions.computeIfAbsent(rpc.Argument.ServerId, __ -> new CacheHolder());
-		if (!session.TryBindSocket(rpc.getSender(), rpc.Argument.GlobalCacheManagerHashIndex)) {
+		if (!session.TryBindSocket(rpc.getSender(), rpc.Argument.GlobalCacheManagerHashIndex, false)) {
 			rpc.SendResultCode(ReLoginBindSocketFail);
 			return 0;
 		}
+		session.setActiveTime(System.currentTimeMillis());
 		rpc.SendResultCode(0);
 		return 0;
 	}
 
 	private long ProcessNormalClose(NormalClose rpc) throws Throwable {
+		logger.info("ProcessNormalClose: {} RequestId={}", rpc.getSender(), rpc.getSessionId());
 		var session = (CacheHolder)rpc.getSender().getUserState();
 		if (session == null) {
+			logger.warn("ProcessNormalClose: {} RequestId={} result={}", rpc.getSender(), rpc.getSessionId(), AcquireNotLogin);
 			rpc.SendResultCode(AcquireNotLogin);
 			return 0; // not login
 		}
 		if (!session.TryUnBindSocket(rpc.getSender())) {
+			logger.warn("ProcessNormalClose: {} RequestId={} result={}", rpc.getSender(), rpc.getSessionId(), NormalCloseUnbindFail);
 			rpc.SendResultCode(NormalCloseUnbindFail);
 			return 0;
 		}
 		var allReleaseFuture = new CountDownFuture();
-		for (var e : session.Acquired.entrySet()) {
+		for (var k : session.Acquired.keySet()) {
 			// ConcurrentDictionary 可以在循环中删除。这样虽然效率低些，但是能处理更多情况。
-			ReleaseAsync(session, e.getKey(), allReleaseFuture.createOne());
+			ReleaseAsync(session, k, allReleaseFuture.createOne());
 		}
 		allReleaseFuture.then(__ -> {
 			rpc.SendResultCode(0);
-			logger.debug("After NormalClose global.Count={}", global.size());
+			logger.info("After NormalClose global.Count={}", global.size());
 		});
 		return 0;
 	}
 
+	private long ProcessKeepAliveRequest(KeepAlive rpc) {
+		if (rpc.getSender().getUserState() == null) {
+			rpc.SendResultCode(AcquireNotLogin);
+			return 0;
+		}
+		var sender = (GlobalCacheManagerAsyncServer.CacheHolder)rpc.getSender().getUserState();
+		sender.setActiveTime(System.currentTimeMillis());
+		rpc.SendResult();
+		return 0;
+	}
+
 	private long ProcessAcquireRequest(Acquire rpc) {
+		var acquireState = rpc.Argument.State;
 		if (ENABLE_PERF)
-			perf.onAcquireBegin(rpc);
+			perf.onAcquireBegin(rpc, acquireState);
 		rpc.Result.GlobalKey = rpc.Argument.GlobalKey;
-		rpc.Result.State = rpc.Argument.State; // default success
+		rpc.Result.State = acquireState; // default success
 
 		if (rpc.getSender().getUserState() == null) {
 			rpc.Result.State = StateInvalid;
 			rpc.SendResultCode(AcquireNotLogin);
 		} else {
 			try {
-				switch (rpc.Argument.State) {
+				var sender = (GlobalCacheManagerAsyncServer.CacheHolder)rpc.getSender().getUserState();
+				sender.setActiveTime(System.currentTimeMillis());
+				switch (acquireState) {
 				case StateInvalid: // release
 					ReleaseAsync(rpc);
 					return 0;
@@ -272,19 +314,19 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			}
 		}
 		if (ENABLE_PERF)
-			perf.onAcquireEnd(rpc);
+			perf.onAcquireEnd(rpc, acquireState);
 		return 0;
 	}
 
-	private static final class CountDownFuture extends RedirectFuture<Object> {
+	public static final class CountDownFuture extends RedirectFuture<Object> {
 		private final AtomicInteger counter = new AtomicInteger(1);
 
-		CountDownFuture createOne() {
+		public CountDownFuture createOne() {
 			counter.incrementAndGet();
 			return this;
 		}
 
-		void finishOne() {
+		public void finishOne() {
 			if (counter.decrementAndGet() == 0)
 				SetResult(null);
 		}
@@ -317,7 +359,8 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				switch (cs.AcquireStatePending) {
 				case StateShare:
 				case StateModify:
-					logger.debug("Release 0 {} {} {}", sender, gKey, cs);
+					if (isDebugEnabled)
+						logger.debug("Release 0 {} {} {}", sender, gKey, cs);
 					break;
 				case StateRemoving:
 					// release 不会导致死锁，等待即可。
@@ -372,11 +415,12 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				switch (cs.AcquireStatePending) {
 				case StateShare:
 				case StateModify:
-					logger.debug("Release 0 {} {} {}", sender, gKey, cs);
+					if (isDebugEnabled)
+						logger.debug("Release 0 {} {} {}", sender, gKey, cs);
 					rpc.Result.State = cs.GetSenderCacheState(sender);
-					rpc.SendResult();
+					rpc.SendResultCode(0);
 					if (ENABLE_PERF)
-						perf.onAcquireEnd(rpc);
+						perf.onAcquireEnd(rpc, StateInvalid);
 					return;
 				case StateRemoving:
 					// release 不会导致死锁，等待即可。
@@ -407,9 +451,9 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			sender.Acquired.remove(gKey);
 			cs.lock.notifyAllWait();
 			rpc.Result.State = cs.GetSenderCacheState(sender);
-			rpc.SendResult();
+			rpc.SendResultCode(0);
 			if (ENABLE_PERF)
-				perf.onAcquireEnd(rpc);
+				perf.onAcquireEnd(rpc, StateInvalid);
 		});
 	}
 
@@ -438,30 +482,31 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 						if (cs.Modify == null)
 							throw new IllegalStateException("CacheState state error");
 						if (cs.Modify == sender) {
-							logger.debug("1 {} {} {}", sender, rpc.Argument.State, cs);
+							if (isDebugEnabled)
+								logger.debug("1 {} {} {}", sender, StateShare, cs);
 							rpc.Result.State = StateInvalid;
-							rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 							rpc.SendResultCode(AcquireShareDeadLockFound);
 							if (ENABLE_PERF)
-								perf.onAcquireEnd(rpc);
+								perf.onAcquireEnd(rpc, StateShare);
 							return;
 						}
 						break;
 					case StateModify:
 						if (cs.Modify == sender || cs.Share.contains(sender)) {
-							logger.debug("2 {} {} {}", sender, rpc.Argument.State, cs);
+							if (isDebugEnabled)
+								logger.debug("2 {} {} {}", sender, StateShare, cs);
 							rpc.Result.State = StateInvalid;
-							rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 							rpc.SendResultCode(AcquireShareDeadLockFound);
 							if (ENABLE_PERF)
-								perf.onAcquireEnd(rpc);
+								perf.onAcquireEnd(rpc, StateShare);
 							return;
 						}
 						break;
 					case StateRemoving:
 						break;
 					}
-					logger.debug("3 {} {} {}", sender, rpc.Argument.State, cs);
+					if (isDebugEnabled)
+						logger.debug("3 {} {} {}", sender, StateShare, cs);
 					state.stage = 1;
 					cs.lock.leaveAndWaitNotify();
 					return;
@@ -473,7 +518,7 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				}
 
 				cs.AcquireStatePending = StateShare;
-				cs.GlobalSerialId = SerialIdGenerator.incrementAndGet();
+				SerialIdGenerator.getAndIncrement();
 			}
 
 			var gKey = cs.GlobalKey;
@@ -484,24 +529,25 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 						// 又重启连上。更新一下。应该是不需要的。
 						sender.Acquired.put(gKey, StateModify);
 						cs.AcquireStatePending = StateInvalid;
-						logger.debug("4 {} {} {}", sender, rpc.Argument.State, cs);
+						if (isDebugEnabled)
+							logger.debug("4 {} {} {}", sender, StateShare, cs);
 						rpc.Result.State = StateModify;
-						rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 						rpc.SendResultCode(AcquireShareAlreadyIsModify);
 						if (ENABLE_PERF)
-							perf.onAcquireEnd(rpc);
+							perf.onAcquireEnd(rpc, StateShare);
 						return;
 					}
 
 					state.reduceResultState = StateReduceNetError; // 默认网络错误。。
-					if (cs.Modify.ReduceWaitLater(gKey, cs.GlobalSerialId, r -> {
+					if (cs.Modify.ReduceWaitLater(gKey, rpc.getResultCode(), r -> {
 						if (ENABLE_PERF)
-							perf.onReduceEnd((Reduce)r);
+							perf.onReduceEnd(r);
 						state.reduceResultState = r.isTimeout() ? StateReduceRpcTimeout : r.Result.State;
 						cs.lock.enter(cs.lock::notifyAllWait);
 						return 0;
 					}) != null) {
-						logger.debug("5 {} {} {}", sender, rpc.Argument.State, cs);
+						if (isDebugEnabled)
+							logger.debug("5 {} {} {}", sender, StateShare, cs);
 						state.stage = 2;
 						cs.lock.leaveAndWaitNotify();
 						return;
@@ -521,6 +567,17 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 					cs.Modify.Acquired.remove(gKey);
 					break;
 
+				case StateReduceErrorFreshAcquire:
+					cs.AcquireStatePending = StateInvalid;
+					cs.lock.notifyAllWait();
+					if (ENABLE_PERF)
+						perf.onOthers("XXX Fresh " + StateShare);
+					rpc.Result.State = StateInvalid;
+					rpc.SendResultCode(StateReduceErrorFreshAcquire);
+					if (ENABLE_PERF)
+						perf.onAcquireEnd(rpc, StateShare);
+					return;
+
 				default:
 					// 包含协议返回错误的值的情况。
 					// case StateReduceRpcTimeout: // 11
@@ -528,12 +585,13 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 					// case StateReduceNetError: // 13
 					cs.AcquireStatePending = StateInvalid;
 					cs.lock.notifyAllWait();
-					logger.error("XXX 8 {} {} {} {}", sender, rpc.Argument.State, cs, state.reduceResultState);
+					if (ENABLE_PERF)
+						perf.onOthers("XXX 8 " + StateShare + " " + state.reduceResultState);
+					// logger.error("XXX 8 {} {} {} {}", sender, StateShare, cs, state.reduceResultState);
 					rpc.Result.State = StateInvalid;
-					rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 					rpc.SendResultCode(AcquireShareFailed);
 					if (ENABLE_PERF)
-						perf.onAcquireEnd(rpc);
+						perf.onAcquireEnd(rpc, StateShare);
 					return;
 				}
 
@@ -542,11 +600,11 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				cs.Share.add(sender);
 				cs.AcquireStatePending = StateInvalid;
 				cs.lock.notifyAllWait();
-				logger.debug("6 {} {} {}", sender, rpc.Argument.State, cs);
-				rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-				rpc.SendResult();
+				if (isDebugEnabled)
+					logger.debug("6 {} {} {}", sender, StateShare, cs);
+				rpc.SendResultCode(0);
 				if (ENABLE_PERF)
-					perf.onAcquireEnd(rpc);
+					perf.onAcquireEnd(rpc, StateShare);
 				return;
 			}
 
@@ -554,11 +612,11 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			cs.Share.add(sender);
 			cs.AcquireStatePending = StateInvalid;
 			cs.lock.notifyAllWait();
-			logger.debug("7 {} {} {}", sender, rpc.Argument.State, cs);
-			rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-			rpc.SendResult();
+			if (isDebugEnabled)
+				logger.debug("7 {} {} {}", sender, StateShare, cs);
+			rpc.SendResultCode(0);
 			if (ENABLE_PERF)
-				perf.onAcquireEnd(rpc);
+				perf.onAcquireEnd(rpc, StateShare);
 		});
 	}
 
@@ -590,30 +648,31 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 							throw new IllegalStateException("CacheState state error");
 
 						if (cs.Modify == sender) {
-							logger.debug("1 {} {} {}", sender, rpc.Argument.State, cs);
+							if (isDebugEnabled)
+								logger.debug("1 {} {} {}", sender, StateModify, cs);
 							rpc.Result.State = StateInvalid;
-							rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 							rpc.SendResultCode(AcquireModifyDeadLockFound);
 							if (ENABLE_PERF)
-								perf.onAcquireEnd(rpc);
+								perf.onAcquireEnd(rpc, StateModify);
 							return;
 						}
 						break;
 					case StateModify:
 						if (cs.Modify == sender || cs.Share.contains(sender)) {
-							logger.debug("2 {} {} {}", sender, rpc.Argument.State, cs);
+							if (isDebugEnabled)
+								logger.debug("2 {} {} {}", sender, StateModify, cs);
 							rpc.Result.State = StateInvalid;
-							rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 							rpc.SendResultCode(AcquireModifyDeadLockFound);
 							if (ENABLE_PERF)
-								perf.onAcquireEnd(rpc);
+								perf.onAcquireEnd(rpc, StateModify);
 							return;
 						}
 						break;
 					case StateRemoving:
 						break;
 					}
-					logger.debug("3 {} {} {}", sender, rpc.Argument.State, cs);
+					if (isDebugEnabled)
+						logger.debug("3 {} {} {}", sender, StateModify, cs);
 					state.stage = 1;
 					cs.lock.leaveAndWaitNotify();
 					return;
@@ -625,47 +684,58 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				}
 
 				cs.AcquireStatePending = StateModify;
-				cs.GlobalSerialId = SerialIdGenerator.incrementAndGet();
+				SerialIdGenerator.getAndIncrement();
 			}
 
 			var gKey = cs.GlobalKey;
 			if (cs.Modify != null || state.stage == 2) {
 				if (state.stage != 2) {
 					if (cs.Modify == sender) {
-						logger.debug("4 {} {} {}", sender, rpc.Argument.State, cs);
+						if (isDebugEnabled)
+							logger.debug("4 {} {} {}", sender, StateModify, cs);
 						// 已经是Modify又申请，可能是sender异常关闭，又重启连上。
 						// 更新一下。应该是不需要的。
 						sender.Acquired.put(gKey, StateModify);
 						cs.AcquireStatePending = StateInvalid;
 						cs.lock.notifyAllWait();
-						rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 						rpc.SendResultCode(AcquireModifyAlreadyIsModify);
 						if (ENABLE_PERF)
-							perf.onAcquireEnd(rpc);
+							perf.onAcquireEnd(rpc, StateModify);
 						return;
 					}
 
 					state.reduceResultState = StateReduceNetError; // 默认网络错误。
-					if (cs.Modify.ReduceWaitLater(gKey, cs.GlobalSerialId, r -> {
+					if (cs.Modify.ReduceWaitLater(gKey, rpc.getResultCode(), r -> {
 						if (ENABLE_PERF)
-							perf.onReduceEnd((Reduce)r);
+							perf.onReduceEnd(r);
 						state.reduceResultState = r.isTimeout() ? StateReduceRpcTimeout : r.Result.State;
 						cs.lock.enter(cs.lock::notifyAllWait);
 						return 0;
 					}) != null) {
-						logger.debug("5 {} {} {}", sender, rpc.Argument.State, cs);
+						if (isDebugEnabled)
+							logger.debug("5 {} {} {}", sender, StateModify, cs);
 						state.stage = 2;
 						cs.lock.leaveAndWaitNotify();
 						return;
 					}
 				}
 
-				//noinspection SwitchStatementWithTooFewBranches
 				switch (state.reduceResultState) {
 				case StateInvalid:
 					assert cs.Modify != null;
 					cs.Modify.Acquired.remove(gKey);
 					break; // reduce success
+
+				case StateReduceErrorFreshAcquire:
+					cs.AcquireStatePending = StateInvalid;
+					cs.lock.notifyAllWait();
+					if (ENABLE_PERF)
+						perf.onOthers("XXX Fresh " + StateModify);
+					rpc.Result.State = StateInvalid;
+					rpc.SendResultCode(StateReduceErrorFreshAcquire);
+					if (ENABLE_PERF)
+						perf.onAcquireEnd(rpc, StateModify);
+					return;
 
 				default:
 					// case StateReduceRpcTimeout: // 11
@@ -673,12 +743,13 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 					// case StateReduceNetError: // 13
 					cs.AcquireStatePending = StateInvalid;
 					cs.lock.notifyAllWait();
-					logger.error("XXX 9 {} {} {} {}", sender, rpc.Argument.State, cs, state.reduceResultState);
+					if (ENABLE_PERF)
+						perf.onOthers("XXX 9 " + StateModify + " " + state.reduceResultState);
+					// logger.error("XXX 9 {} {} {} {}", sender, StateModify, cs, state.reduceResultState);
 					rpc.Result.State = StateInvalid;
-					rpc.Result.GlobalSerialId = cs.GlobalSerialId;
 					rpc.SendResultCode(AcquireModifyFailed);
 					if (ENABLE_PERF)
-						perf.onAcquireEnd(rpc);
+						perf.onAcquireEnd(rpc, StateModify);
 					return;
 				}
 
@@ -687,11 +758,11 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				cs.Share.remove(sender);
 				cs.AcquireStatePending = StateInvalid;
 				cs.lock.notifyAllWait();
-				logger.debug("6 {} {} {}", sender, rpc.Argument.State, cs);
-				rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-				rpc.SendResult();
+				if (isDebugEnabled)
+					logger.debug("6 {} {} {}", sender, StateModify, cs);
+				rpc.SendResultCode(0);
 				if (ENABLE_PERF)
-					perf.onAcquireEnd(rpc);
+					perf.onAcquireEnd(rpc, StateModify);
 				return;
 			}
 
@@ -709,10 +780,13 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 					continue;
 				}
 				allReduceFuture.createOne();
-				Reduce reduce = c.ReduceWaitLater(gKey, cs.GlobalSerialId, r -> {
+				Reduce reduce = c.ReduceWaitLater(gKey, rpc.getResultCode(), r -> {
 					if (ENABLE_PERF)
-						perf.onReduceEnd((Reduce)r);
+						perf.onReduceEnd(r);
+					// cs.lock.enter(() -> {
+					// 	cs.Share.remove(c);
 					allReduceFuture.finishOne();
+					// });
 					return 0;
 				});
 				if (reduce == null) {
@@ -725,6 +799,7 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			}
 			boolean senderIsShare = senderIsShareTmp;
 
+			var errorFreshAcquire = new OutObject<Boolean>();
 			Action0 lastStage = () -> {
 				// 移除成功的。
 				for (var it = reduceSucceed.iterator(); it.moveToNext(); ) {
@@ -743,9 +818,9 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 					cs.Modify = sender;
 					cs.AcquireStatePending = StateInvalid;
 					cs.lock.notifyAllWait();
-					logger.debug("8 {} {} {}", sender, rpc.Argument.State, cs);
-					rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-					rpc.SendResult();
+					if (isDebugEnabled)
+						logger.debug("8 {} {} {}", sender, StateModify, cs);
+					rpc.SendResultCode(0);
 				} else {
 					// senderIsShare 在失败的时候，Acquired 没有变化，不需要更新。
 					// 失败了，要把原来是share的sender恢复。先这样吧。
@@ -753,13 +828,17 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 						cs.Share.add(sender);
 					cs.AcquireStatePending = StateInvalid;
 					cs.lock.notifyAllWait();
-					logger.error("XXX 10 {} {} {}", sender, rpc.Argument.State, cs);
+					if (ENABLE_PERF)
+						perf.onOthers("XXX 10 " + StateModify);
+					// logger.error("XXX 10 {} {} {}", sender, StateModify, cs);
 					rpc.Result.State = StateInvalid;
-					rpc.Result.GlobalSerialId = cs.GlobalSerialId;
-					rpc.SendResultCode(AcquireModifyFailed);
+					if (errorFreshAcquire.Value)
+						rpc.SendResultCode(StateReduceErrorFreshAcquire); // 这个错误不看做失败，允许发送方继续尝试。
+					else
+						rpc.SendResultCode(AcquireModifyFailed);
 				}
 				if (ENABLE_PERF)
-					perf.onAcquireEnd(rpc);
+					perf.onAcquireEnd(rpc, StateModify);
 				// 很好，网络失败不再看成成功，发现除了加break，
 				// 其他处理已经能包容这个改动，都不用动。
 			};
@@ -768,14 +847,28 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 			// 1. share是空的, 可以直接升为Modify
 			// 2. sender是share, 而且reducePending的size是0
 			if (!cs.Share.isEmpty() && (!senderIsShare || !reducePending.isEmpty())) {
-				logger.debug("7 {} {} {}", sender, rpc.Argument.State, cs);
+				if (isDebugEnabled)
+					logger.debug("7 {} {} {}", sender, StateModify, cs);
 				allReduceFuture.then(__ -> {
 					// 一个个等待是否成功。WaitAll 碰到错误不知道怎么处理的，
 					// 应该也会等待所有任务结束（包括错误）。
+					var freshAcquire = false;
 					for (var e : reducePending) {
 						var cacheHolder = e.getKey();
 						var reduce = e.getValue();
 						try {
+							switch (reduce.Result.State) {
+							case StateInvalid:
+								reduceSucceed.add(cacheHolder);
+								break;
+							case StateReduceErrorFreshAcquire:
+								// 这个错误不进入Forbid状态。
+								freshAcquire = true;
+								break;
+							default:
+								cacheHolder.SetError();
+								break;
+							}
 							if (reduce.Result.State == StateInvalid)
 								reduceSucceed.add(cacheHolder);
 							else
@@ -783,10 +876,16 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 						} catch (Throwable ex) {
 							cacheHolder.SetError();
 							// 等待失败不再看作成功。
-							logger.error(String.format("Reduce %s AcquireState=%d CacheState=%s arg=%s",
-									rpc.getSender().getUserState(), rpc.Argument.State, cs, reduce.Argument), ex);
+							if (Task.getRootCause(ex) instanceof RpcTimeoutException) {
+								logger.warn("Reduce Timeout {} AcquireState={} CacheState={} arg={}",
+										rpc.getSender().getUserState(), StateModify, cs, reduce.Argument);
+							} else {
+								logger.error("Reduce {} AcquireState={} CacheState={} arg={}",
+										rpc.getSender().getUserState(), StateModify, cs, reduce.Argument, ex);
+							}
 						}
 					}
+					errorFreshAcquire.Value = freshAcquire;
 					cs.lock.enter(lastStage);
 				});
 			} else
@@ -800,7 +899,6 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 		final AsyncLock lock = new AsyncLock();
 		CacheHolder Modify;
 		int AcquireStatePending = StateInvalid;
-		long GlobalSerialId;
 
 		public CacheState(Binary gKey) {
 			GlobalKey = gKey;
@@ -823,16 +921,44 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 	}
 
 	private static final class CacheHolder {
-		static final long ForbidPeriod = 10 * 1000; // 10 seconds
-
 		final ConcurrentHashMap<Binary, Integer> Acquired = new ConcurrentHashMap<>();
 		long SessionId;
 		int GlobalCacheManagerHashIndex;
+		private volatile long ActiveTime = System.currentTimeMillis();
 		private volatile long LastErrorTime;
+		private boolean Logined = false; // 改成State，也能表示已经kick过，下一次不再kick？
 
-		synchronized boolean TryBindSocket(AsyncSocket newSocket, int _GlobalCacheManagerHashIndex) {
-			if (newSocket.getUserState() != null)
+		long getActiveTime() {
+			return ActiveTime;
+		}
+
+		void setActiveTime(long value) {
+			ActiveTime = value;
+		}
+
+		// not under lock
+		void kick() {
+			var peer = Instance.Server.GetSocket(SessionId);
+			if (null != peer) {
+				peer.setUserState(null); // 来自这个Agent的所有请求都会失败。
+				peer.close(); // 关闭连接，强制Agent重新登录。
+			}
+			SessionId = 0; // 清除网络状态。
+		}
+
+		synchronized boolean TryBindSocket(AsyncSocket newSocket, int _GlobalCacheManagerHashIndex, boolean login) {
+			if (login) {
+				// login 相当于重置，允许再次Login。
+				Logined = true;
+			} else {
+				// relogin 必须login之后才允许ReLogin。这个用来检测Global宕机并重启。
+				if (!Logined)
+					return false;
+			}
+			if (newSocket.getUserState() != null) {
+				logger.warn("TryBindSocket: already bound! newSocket.getUserState() != null, SessionId={}", newSocket.getSessionId());
 				return false; // 不允许再次绑定。Login Or ReLogin 只能发一次。
+			}
 
 			var socket = Instance.Server.GetSocket(SessionId);
 			if (socket == null) {
@@ -842,7 +968,8 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				GlobalCacheManagerHashIndex = _GlobalCacheManagerHashIndex;
 				return true;
 			}
-			// 每个AutoKeyLocalId只允许一个实例，已经存在了以后，旧的实例上有状态，阻止新的实例登录成功。
+			// 每个ServerId只允许一个实例，已经存在了以后，旧的实例上有状态，阻止新的实例登录成功。
+			logger.warn("TryBindSocket: already bound! GetSocket(SessionId={}) != null", newSocket.getSessionId());
 			return false;
 		}
 
@@ -867,32 +994,32 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 
 		void SetError() {
 			long now = System.currentTimeMillis();
-			if (now - LastErrorTime > ForbidPeriod)
+			if (now - LastErrorTime > Instance.AchillesHeelConfig.GlobalForbidPeriod)
 				LastErrorTime = now;
 		}
 
 		/**
 		 * 返回null表示发生了网络错误，或者应用服务器已经关闭。
 		 */
-		Reduce ReduceWaitLater(Binary gkey, long globalSerialId, ProtocolHandle<Rpc<Param2, Param2>> handle) {
+		Reduce ReduceWaitLater(Binary gkey, long fresh, ProtocolHandle<Rpc<GlobalKeyState, GlobalKeyState>> handle) {
 			try {
-				if (System.currentTimeMillis() - LastErrorTime < ForbidPeriod)
+				if (System.currentTimeMillis() - LastErrorTime < Instance.AchillesHeelConfig.GlobalForbidPeriod)
 					return null;
 				AsyncSocket peer = Instance.Server.GetSocket(SessionId);
 				if (peer != null) {
-					var reduce = new Reduce(gkey, StateInvalid, globalSerialId);
+					var reduce = new Reduce(gkey, StateInvalid);
+					reduce.setResultCode(fresh);
 					if (ENABLE_PERF)
 						Instance.perf.onReduceBegin(reduce);
-					if (reduce.Send(peer, handle, 10000))
+					if (reduce.Send(peer, handle, Instance.AchillesHeelConfig.ReduceTimeout))
 						return reduce;
 					if (ENABLE_PERF)
 						Instance.perf.onReduceCancel(reduce);
 				}
-				logger.warn("Send Reduce failed. SessionId={}, peer={}, gkey={}, globalSerialId={}",
-						SessionId, peer, gkey, globalSerialId);
+				logger.warn("Send Reduce failed. SessionId={}, peer={}, gkey={}", SessionId, peer, gkey);
 			} catch (Throwable ex) {
 				// 这里的异常只应该是网络发送异常。
-				logger.error("ReduceWaitLater Exception " + gkey, ex);
+				logger.error("ReduceWaitLater Exception {}", gkey, ex);
 			}
 			SetError();
 			return null;
@@ -906,12 +1033,14 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 
 		@Override
 		public void OnSocketAccept(AsyncSocket so) throws Throwable {
+			logger.info("OnSocketAccept {}", so);
 			// so.UserState = new CacheHolder(so.SessionId); // Login ReLogin 的时候初始化。
 			super.OnSocketAccept(so);
 		}
 
 		@Override
 		public void OnSocketClose(AsyncSocket so, Throwable e) throws Throwable {
+			logger.info("OnSocketClose {}", so);
 			var session = (CacheHolder)so.getUserState();
 			if (session != null)
 				session.TryUnBindSocket(so); // unbind when login
@@ -967,7 +1096,7 @@ public final class GlobalCacheManagerAsyncServer implements GlobalCacheManagerCo
 				raftConf = args[++i];
 				break;
 			case "-tryNextSync":
-				AsyncLock.tryNextSync = true;
+				System.setProperty("AsyncLock.tryNextSync", "true");
 				break;
 			default:
 				throw new IllegalArgumentException("unknown argument: " + args[i]);

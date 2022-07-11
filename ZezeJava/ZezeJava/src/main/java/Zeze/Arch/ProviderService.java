@@ -8,16 +8,13 @@ import Zeze.Builtin.Provider.Bind;
 import Zeze.Builtin.Provider.Subscribe;
 import Zeze.Net.AsyncSocket;
 import Zeze.Net.Connector;
-import Zeze.Net.Protocol;
 import Zeze.Services.ServiceManager.ServiceInfo;
 import Zeze.Services.ServiceManager.ServiceInfos;
 import Zeze.Util.OutObject;
 import Zeze.Util.TaskCompletionSource;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 public class ProviderService extends Zeze.Services.HandshakeClient {
-	private static final Logger logger = LogManager.getLogger(ProviderService.class);
+	// private static final Logger logger = LogManager.getLogger(ProviderService.class);
 
 	public ProviderApp ProviderApp;
 	private final ConcurrentHashMap<String, Connector> Links = new ConcurrentHashMap<>();
@@ -46,6 +43,9 @@ public class ProviderService extends Zeze.Services.HandshakeClient {
 	}
 
 	public void kick(String linkName, long linkSid, int code, String desc) {
+		if (linkSid == 0)
+			return;
+
 		var link = Links.get(linkName);
 		if (null != link)
 			ProviderImplement.SendKick(link.TryGetReadySocket(), linkSid, code, desc);
@@ -68,8 +68,7 @@ public class ProviderService extends Zeze.Services.HandshakeClient {
 					try {
 						outC.Value.Start();
 					} catch (Throwable e) {
-						logger.error("", e);
-						return null;
+						throw new RuntimeException(e);
 					}
 				}
 				return outC.Value;
@@ -149,15 +148,6 @@ public class ProviderService extends Zeze.Services.HandshakeClient {
 			ProviderDynamicSubscribeCompleted.SetResult(true);
 			return 0;
 		});
-	}
-
-	@Override
-	public <P extends Protocol<?>> void DispatchProtocol(P p, ProtocolFactoryHandle<P> factoryHandle) throws Throwable {
-		// 防止Client不进入加密，直接发送用户协议。
-		if (!IsHandshakeProtocol(p.getTypeId())) {
-			p.getSender().VerifySecurity();
-		}
-		super.DispatchProtocol(p, factoryHandle);
 	}
 
 	/*

@@ -1,8 +1,8 @@
 package Zeze.Raft;
 
 import java.util.ArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.ToLongFunction;
 import Zeze.Application;
 import Zeze.Config;
@@ -21,12 +21,12 @@ import Zeze.Util.PersistentAtomicLong;
 import Zeze.Util.Random;
 import Zeze.Util.Task;
 import Zeze.Util.TaskCompletionSource;
-import Zeze.Util.ThreadFactoryWithName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 public final class Agent {
 	private static final Logger logger = LogManager.getLogger(Agent.class);
+	private static final boolean isDebugEnabled = logger.isDebugEnabled();
 
 	// 保证在Raft-Server检查UniqueRequestId唯一性过期前唯一即可。
 	// 使用持久化是为了避免短时间重启，Id重复。
@@ -35,16 +35,25 @@ public final class Agent {
 	private NetClient Client;
 	private volatile ConnectorEx _Leader;
 	private final LongConcurrentHashMap<RaftRpc<?, ?>> Pending = new LongConcurrentHashMap<>();
-	private final ExecutorService InternalThreadPool;
 	private long Term;
 	public boolean DispatchProtocolToInternalThreadPool;
+	private int PendingLimit = 5000; // -1 no limit
 
 	// 加急请求ReSend时优先发送，多个请求不保证顺序。这个应该仅用于Login之类的特殊协议，一般来说只有一个。
 	private final LongConcurrentHashMap<RaftRpc<?, ?>> UrgentPending = new LongConcurrentHashMap<>();
 	private Action1<Agent> OnSetLeader;
+	private final Lock mutex = new ReentrantLock();
 
 	public RaftConfig getRaftConfig() {
 		return RaftConfig;
+	}
+
+	public int getPendingLimit() {
+		return PendingLimit;
+	}
+
+	public void setPendingLimit(int value) {
+		PendingLimit = value;
 	}
 
 	public NetClient getClient() {
@@ -57,10 +66,6 @@ public final class Agent {
 
 	public ConnectorEx getLeader() {
 		return _Leader;
-	}
-
-	public ExecutorService getInternalThreadPool() {
-		return InternalThreadPool;
 	}
 
 	public long getTerm() {
@@ -84,9 +89,12 @@ public final class Agent {
 	 * 发送Rpc请求。
 	 */
 	public <TArgument extends Bean, TResult extends Bean> void Send(RaftRpc<TArgument, TResult> rpc,
-																	ToLongFunction<Protocol<?>> handle, boolean urgent) {
+																	ToLongFunction<Protocol<?>> handle,
+																	boolean urgent) {
 		if (handle == null)
 			throw new NullPointerException();
+		if (PendingLimit > 0 && Pending.size() > PendingLimit) // UrgentPending不限制。
+			throw new RuntimeException("too many pending");
 
 		// 由于interface不能把setter弄成保护的，实际上外面可以修改。
 		// 简单检查一下吧。
@@ -94,23 +102,27 @@ public final class Agent {
 			throw new IllegalStateException("RaftRpc.UniqueRequestId != 0. Need A Fresh RaftRpc");
 
 		rpc.getUnique().setRequestId(UniqueRequestIdGenerator.next());
-		rpc.getUnique().setClientId(UniqueRequestIdGenerator.getName());
+		// 外面可以设置clientId，默认使用Generator.getName();
+		if (rpc.getUnique().getClientId().isEmpty())
+			rpc.getUnique().setClientId(UniqueRequestIdGenerator.getName());
 		rpc.setCreateTime(System.currentTimeMillis());
 		rpc.setSendTime(rpc.getCreateTime());
-		rpc.setTimeout(RaftConfig.getAppendEntriesTimeout());
+		if (rpc.getTimeout() == 0) // set default timeout
+			rpc.setTimeout(RaftConfig.getAppendEntriesTimeout());
 
 		rpc.setUrgent(urgent);
 		var pending = urgent ? UrgentPending : Pending;
+		rpc.Handle = handle;
 		if (pending.putIfAbsent(rpc.getUnique().getRequestId(), rpc) != null)
 			throw new IllegalStateException("duplicate requestId rpc=" + rpc);
 
-		rpc.setResponseHandle(p -> SendHandle(p, handle, rpc));
+		rpc.setResponseHandle(p -> SendHandle(p, rpc));
 		ConnectorEx leader = _Leader;
-		rpc.Send(leader != null ? leader.TryGetReadySocket() : null);
+		if (!rpc.Send(leader != null ? leader.TryGetReadySocket() : null))
+			logger.warn("Send failed: leader={}, rpc={}", leader, rpc);
 	}
 
 	private <TArgument extends Bean, TResult extends Bean> long SendHandle(Rpc<TArgument, TResult> p,
-																		   ToLongFunction<Protocol<?>> userHandle,
 																		   RaftRpc<TArgument, TResult> rpc) {
 		var net = (RaftRpc<TArgument, TResult>)p;
 		if (net.isTimeout() || IsRetryError(net.getResultCode()))
@@ -126,9 +138,10 @@ public final class Agent {
 
 			if (rpc.getResultCode() == Procedure.RaftApplied)
 				rpc.setIsTimeout(false);
-			logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
-					rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
-			return userHandle.applyAsLong(rpc);
+			if (isDebugEnabled)
+				logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
+						rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
+			return rpc.Handle.applyAsLong(rpc);
 		}
 		return Procedure.Success;
 	}
@@ -141,7 +154,6 @@ public final class Agent {
 
 	@SuppressWarnings("SameReturnValue")
 	private <TArgument extends Bean, TResult extends Bean> long SendForWaitHandle(Rpc<TArgument, TResult> p,
-																				  TaskCompletionSource<RaftRpc<TArgument, TResult>> future,
 																				  RaftRpc<TArgument, TResult> rpc) {
 		var net = (RaftRpc<TArgument, TResult>)p;
 		if (net.isTimeout() || IsRetryError(net.getResultCode()))
@@ -157,9 +169,10 @@ public final class Agent {
 
 			if (rpc.getResultCode() == Procedure.RaftApplied)
 				rpc.setIsTimeout(false);
-			logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
-					rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
-			future.SetResult(rpc);
+			if (isDebugEnabled)
+				logger.debug("Agent Rpc={} RequestId={} ResultCode={} Sender={}",
+						rpc.getClass().getSimpleName(), requestId, rpc.getResultCode(), rpc.getSender());
+			rpc.Future.SetResult(rpc);
 		}
 		return Procedure.Success;
 	}
@@ -171,27 +184,33 @@ public final class Agent {
 
 	public <TArgument extends Bean, TResult extends Bean> TaskCompletionSource<RaftRpc<TArgument, TResult>> SendForWait(
 			RaftRpc<TArgument, TResult> rpc, boolean urgent) {
+		if (PendingLimit > 0 && Pending.size() > PendingLimit) // UrgentPending不限制。
+			throw new RuntimeException("too many pending");
 		// 由于interface不能把setter弄成保护的，实际上外面可以修改。
 		// 简单检查一下吧。
 		if (rpc.getUnique().getRequestId() != 0)
 			throw new IllegalStateException("RaftRpc.UniqueRequestId != 0. Need A Fresh RaftRpc");
 
 		rpc.getUnique().setRequestId(UniqueRequestIdGenerator.next());
-		rpc.getUnique().setClientId(UniqueRequestIdGenerator.getName());
+		// 外面在发送前可以设置clientId
+		if (rpc.getUnique().getClientId().isEmpty())
+			rpc.getUnique().setClientId(UniqueRequestIdGenerator.getName());
 		rpc.setCreateTime(System.currentTimeMillis());
 		rpc.setSendTime(rpc.getCreateTime());
-		rpc.setTimeout(RaftConfig.getAppendEntriesTimeout());
+		if (rpc.getTimeout() == 0) // set default timeout
+			rpc.setTimeout(RaftConfig.getAppendEntriesTimeout());
 
 		var future = new TaskCompletionSource<RaftRpc<TArgument, TResult>>();
-
 		rpc.setUrgent(urgent);
 		var pending = urgent ? UrgentPending : Pending;
+		rpc.Future = future;
 		if (pending.putIfAbsent(rpc.getUnique().getRequestId(), rpc) != null)
 			throw new IllegalStateException("duplicate requestId rpc=" + rpc);
 
-		rpc.setResponseHandle(p -> SendForWaitHandle(p, future, rpc));
+		rpc.setResponseHandle(p -> SendForWaitHandle(p, rpc));
 		ConnectorEx leader = _Leader;
-		rpc.Send(leader != null ? leader.TryGetReadySocket() : null);
+		if (!rpc.Send(leader != null ? leader.TryGetReadySocket() : null))
+			logger.warn("Send failed: leader={}, rpc={}", leader, rpc);
 		return future;
 	}
 
@@ -205,20 +224,21 @@ public final class Agent {
 		}
 	}
 
-	public synchronized void Stop() throws Throwable {
-		if (Client == null)
-			return;
+	public void Stop() throws Throwable {
+		mutex.lock();
+		try {
+			if (Client == null)
+				return;
 
-		Application zeze = Client.getZeze();
-		Client.Stop();
-		Client = null;
+			Client.Stop();
+			Client = null;
 
-		if (zeze == null)
-			InternalThreadPool.shutdown();
-
-		_Leader = null;
-		Pending.clear();
-		UrgentPending.clear();
+			_Leader = null;
+			Pending.clear();
+			UrgentPending.clear();
+		} finally {
+			mutex.unlock();
+		}
 	}
 
 	public Agent(String name, Application zeze) throws Throwable {
@@ -226,7 +246,6 @@ public final class Agent {
 	}
 
 	public Agent(String name, Application zeze, RaftConfig raftConf) throws Throwable {
-		InternalThreadPool = zeze.__GetInternalThreadPoolUnsafe();
 		UniqueRequestIdGenerator = PersistentAtomicLong.getOrAdd(name + '.' + zeze.getConfig().getServerId());
 		Init(new NetClient(this, name, zeze), raftConf);
 	}
@@ -236,7 +255,6 @@ public final class Agent {
 	}
 
 	public Agent(String name, RaftConfig raftConf, Zeze.Config config) throws Throwable {
-		InternalThreadPool = Task.newFixedThreadPool(5, "RaftAgent");
 		if (config == null)
 			config = Config.Load();
 
@@ -310,52 +328,126 @@ public final class Agent {
 		ReSend(false);
 	}
 
+	public void CancelPending() {
+		// 不包括UrgentPending
+		if (Pending.size() == 0)
+			return;
+
+		var removed = new ArrayList<RaftRpc<?, ?>>();
+		// Pending存在并发访问，这样写更可靠。
+		for (var rpc : Pending) {
+			var r = Pending.remove(rpc.getUnique().getRequestId());
+			if (null != r)
+				removed.add(r);
+		}
+		if (isDebugEnabled)
+			logger.debug("Found {} RaftRpc cancel", removed.size());
+		if (DispatchProtocolToInternalThreadPool)
+			Task.getCriticalThreadPool().execute(() -> trigger(removed, "Cancel"));
+		else
+			Task.run(() -> trigger(removed, "Cancel"), "Trigger Timeout RaftRpcs");
+	}
+
 	private void ReSend(boolean immediately) {
 		ConnectorEx leader = _Leader;
 		if (leader != null)
 			leader.Start();
 		// ReSendPendingRpc
 		var leaderSocket = leader != null ? leader.TryGetReadySocket() : null;
-		if (leaderSocket != null) {
-			long now = System.currentTimeMillis();
-			long timeout = RaftConfig.getAppendEntriesTimeout() + 1000;
-			int i = 0;
-			for (var rpc : UrgentPending) {
-				if (immediately || now - rpc.getSendTime() > timeout) {
-					logger.debug("ReSendU {}/{} {} {}", i, UrgentPending.size(), leaderSocket, rpc);
-					rpc.setSendTime(now);
-					if (!rpc.Send(leaderSocket))
-						logger.warn("SendRequest failed {}", rpc);
+		ArrayList<RaftRpc<?, ?>> removed = null;
+		long now = System.currentTimeMillis();
+		long timeout = RaftConfig.getAppendEntriesTimeout() + 1000;
+		for (var rpc : UrgentPending) {
+			if (rpc.getTimeout() > 0 && now - rpc.getCreateTime() > rpc.getTimeout()) {
+				rpc = UrgentPending.remove(rpc.getUnique().getRequestId());
+				if (rpc != null) {
+					if (removed == null)
+						removed = new ArrayList<>();
+					removed.add(rpc);
 				}
-				i++;
+				continue;
 			}
-			i = 0;
-			for (var rpc : Pending) {
-				if (immediately || now - rpc.getSendTime() > timeout) {
-					logger.debug("ReSend {}/{} {} {}", i, Pending.size(), leaderSocket, rpc);
-					rpc.setSendTime(now);
-					if (!rpc.Send(leaderSocket))
-						logger.warn("SendRequest failed {}", rpc);
+			if (immediately || now - rpc.getSendTime() > timeout) {
+				if (isDebugEnabled)
+					logger.debug("ReSendU {}/{} {}", UrgentPending.size(), leaderSocket, rpc);
+				rpc.setSendTime(now);
+				if (!rpc.Send(leaderSocket)) {
+					logger.info("SendRequest failed {}", rpc);
+					break;
 				}
-				i++;
+			}
+		}
+		for (var rpc : Pending) {
+			if (rpc.getTimeout() > 0 && now - rpc.getCreateTime() > rpc.getTimeout()) {
+				rpc = Pending.remove(rpc.getUnique().getRequestId());
+				if (rpc != null) {
+					if (removed == null)
+						removed = new ArrayList<>();
+					removed.add(rpc);
+				}
+				continue;
+			}
+			if (immediately || now - rpc.getSendTime() > timeout) {
+				if (isDebugEnabled)
+					logger.debug("ReSend {}/{} {}", Pending.size(), leaderSocket, rpc);
+				rpc.setSendTime(now);
+				if (!rpc.Send(leaderSocket)) {
+					logger.info("SendRequest failed {}", rpc);
+					break;
+				}
+			}
+		}
+		if (removed != null) {
+			if (isDebugEnabled)
+				logger.debug("Found {} RaftRpc timeout", removed.size());
+			var removed0 = removed;
+			if (DispatchProtocolToInternalThreadPool)
+				Task.getCriticalThreadPool().execute(() -> trigger(removed0));
+			else
+				Task.run(() -> trigger(removed0), "Trigger Timeout RaftRpcs");
+		}
+	}
+
+	private void trigger(ArrayList<RaftRpc<?, ?>> removed) {
+		trigger(removed, "Timeout");
+	}
+
+	private void trigger(ArrayList<RaftRpc<?, ?>> removed, String reason) {
+		for (var r : removed) {
+			if (null == r)
+				continue;
+			r.setIsTimeout(true);
+			if (null != r.Future) {
+				r.Future.SetException(new RuntimeException(reason));
+			} else {
+				try {
+					r.Handle.applyAsLong(r);
+				} catch (Throwable e) {
+					logger.error("", e);
+				}
 			}
 		}
 	}
 
-	public synchronized boolean SetLeader(LeaderIs r, ConnectorEx newLeader) throws Throwable {
-		if (r.Argument.getTerm() < Term) {
-			logger.warn("Skip LeaderIs {} {}", newLeader.getName(), r);
-			return false;
-		}
+	public boolean SetLeader(LeaderIs r, ConnectorEx newLeader) throws Throwable {
+		mutex.lock();
+		try {
+			if (r.Argument.getTerm() < Term) {
+				logger.warn("Skip LeaderIs {} {}", newLeader.getName(), r);
+				return false;
+			}
 
-		_Leader = newLeader; // change current Leader
-		Term = r.Argument.getTerm();
-		if (newLeader != null)
-			newLeader.Start(); // try connect immediately
-		Action1<Agent> onSetLeader = OnSetLeader;
-		if (onSetLeader != null)
-			onSetLeader.run(this);
-		return true;
+			_Leader = newLeader; // change current Leader
+			Term = r.Argument.getTerm();
+			if (newLeader != null)
+				newLeader.Start(); // try connect immediately
+			Action1<Agent> onSetLeader = OnSetLeader;
+			if (onSetLeader != null)
+				onSetLeader.run(this);
+			return true;
+		} finally {
+			mutex.unlock();
+		}
 	}
 
 	public static final class NetClient extends HandshakeClient {
@@ -388,12 +480,9 @@ public final class Agent {
 
 		@Override
 		public <P extends Protocol<?>> void DispatchProtocol(P p, ProtocolFactoryHandle<P> pfh) {
-			// 防止Client不进入加密，直接发送用户协议。
-			if (!IsHandshakeProtocol(p.getTypeId()))
-				p.getSender().VerifySecurity();
-
+			// 虚拟线程创建太多Critical线程反而容易卡,以后考虑跑另个虚拟线程池里
 			if (p.getTypeId() == LeaderIs.TypeId_ || Agent.DispatchProtocolToInternalThreadPool)
-				Agent.InternalThreadPool.execute(() -> Task.Call(() -> pfh.Handle.handle(p), "InternalRequest"));
+				Task.getCriticalThreadPool().execute(() -> Task.Call(() -> pfh.Handle.handle(p), "InternalRequest"));
 			else
 				Task.run(() -> pfh.Handle.handle(p), p);
 		}

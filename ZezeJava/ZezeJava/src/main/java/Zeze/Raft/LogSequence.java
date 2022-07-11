@@ -12,10 +12,12 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import Zeze.Net.Binary;
 import Zeze.Net.Protocol;
 import Zeze.Serialize.ByteBuffer;
+import Zeze.Transaction.DatabaseRocksDb;
 import Zeze.Transaction.Procedure;
 import Zeze.Util.LongConcurrentHashMap;
 import Zeze.Util.Task;
@@ -30,6 +32,7 @@ import org.rocksdb.WriteOptions;
 
 public class LogSequence {
 	static final Logger logger = LogManager.getLogger(LogSequence.class);
+	private static final boolean isDebugEnabled = logger.isDebugEnabled();
 	public static final String SnapshotFileName = "snapshot.dat";
 
 	private final Raft Raft;
@@ -49,7 +52,7 @@ public class LogSequence {
 
 	private long LeaderActiveTime = System.currentTimeMillis(); // Leader, Follower
 
-	private WriteOptions WriteOptions = new WriteOptions().setSync(true);
+	private WriteOptions WriteOptions = DatabaseRocksDb.getSyncWriteOptions();
 	private RocksDB Logs;
 	private RocksDB Rafts;
 	private final ConcurrentHashMap<String, UniqueRequestSet> UniqueRequestSets = new ConcurrentHashMap<>();
@@ -64,7 +67,7 @@ public class LogSequence {
 
 	// 是否有安装进程正在进行中，用来阻止新的创建请求。
 	private final ConcurrentHashMap<String, Server.ConnectorEx> InstallSnapshotting = new ConcurrentHashMap<>();
-	private Future<?> SnapshotTimer;
+	private long PrevSnapshotIndex;
 	private boolean Snapshotting = false; // 是否正在创建Snapshot过程中，用来阻止新的创建请求。
 
 	static {
@@ -120,24 +123,33 @@ public class LogSequence {
 	}
 
 	public void CommitSnapshot(String path, long newFirstIndex) throws IOException, RocksDBException {
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			Files.move(Paths.get(path), Paths.get(getSnapshotFullName()), StandardCopyOption.REPLACE_EXISTING);
 			SaveFirstIndex(newFirstIndex);
 			StartRemoveLogOnlyBefore(newFirstIndex);
+		} finally {
+			Raft.unlock();
 		}
 	}
 
 	private RocksIterator NewLogsIterator() {
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			return Logs.newIterator();
+		} finally {
+			Raft.unlock();
 		}
 	}
 
 	private void StartRemoveLogOnlyBefore(long index) {
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			if (RemoveLogBeforeFuture != null || !LogsAvailable || Raft.IsShutdown)
 				return;
 			RemoveLogBeforeFuture = new TaskCompletionSource<>();
+		} finally {
+			Raft.unlock();
 		}
 
 		// 直接对 RocksDb 多线程访问，这里就不做多线程保护了。
@@ -146,8 +158,8 @@ public class LogSequence {
 				try (var it = NewLogsIterator()) {
 					it.seekToFirst();
 					while (LogsAvailable && !Raft.IsShutdown && it.isValid()) {
-						var raftLog = RaftLog.Decode(new Binary(it.value()), Raft.getStateMachine()::LogFactory);
-						if (raftLog.getIndex() >= index) {
+						// 这里只需要log的Index，直接从key里面获取了。
+						if (ByteBuffer.Wrap(it.key()).ReadLong() >= index) {
 							RemoveLogBeforeFuture.SetResult(true);
 							return;
 						}
@@ -196,7 +208,7 @@ public class LogSequence {
 			try {
 				return RocksDB.open(options, path);
 			} catch (RocksDBException e) {
-				logger.info("RocksDB.open " + path, e);
+				logger.info("RocksDB.open {}", path, e);
 				lastE = e;
 				try {
 					Thread.sleep(1000);
@@ -285,25 +297,35 @@ public class LogSequence {
 			return state;
 		}
 
+		private final Lock mutex = new ReentrantLock();
+
 		private RocksDB OpenDb() throws IOException, RocksDBException {
-			synchronized (this) {
+			mutex.lock();
+			try {
 				if (null == getDb()) {
 					var dir = Paths.get(getLogSequence().Raft.getRaftConfig().getDbHome(), "unique").toString();
 					try {
 						Files.createDirectories(Paths.get(dir));
 					} catch (FileAlreadyExistsException ignored) {
 					}
-					Db = Zeze.Raft.LogSequence.OpenDb(new Options().setCreateIfMissing(true),
+					Db = Zeze.Raft.LogSequence.OpenDb(DatabaseRocksDb.getCommonOptions(),
 							Paths.get(dir, getDbName()).toString());
 				}
 				return getDb();
+			} finally {
+				mutex.unlock();
 			}
 		}
 
-		public synchronized void Dispose() {
-			if (Db != null) {
-				Db.close();
-				Db = null;
+		public void Dispose() {
+			mutex.lock();
+			try {
+				if (Db != null) {
+					Db.close();
+					Db = null;
+				}
+			} finally {
+				mutex.unlock();
 			}
 		}
 	}
@@ -360,9 +382,8 @@ public class LogSequence {
 		// must after set Raft.IsShutdown = false;
 		CancelPendingAppendLogFutures();
 
-		synchronized (Raft) {
-			if (SnapshotTimer != null)
-				SnapshotTimer.cancel(false);
+		Raft.lock();
+		try {
 			if (Logs != null) {
 				Logs.close();
 				Logs = null;
@@ -374,14 +395,15 @@ public class LogSequence {
 			for (var db : UniqueRequestSets.values())
 				db.Dispose();
 			UniqueRequestSets.clear();
+		} finally {
+			Raft.unlock();
 		}
 	}
 
 	public LogSequence(Raft raft) throws RocksDBException {
 		Raft = raft;
-		var options = new Options().setCreateIfMissing(true);
 
-		Rafts = OpenDb(options, Paths.get(Raft.getRaftConfig().getDbHome(), "rafts").toString());
+		Rafts = OpenDb(DatabaseRocksDb.getCommonOptions(), Paths.get(Raft.getRaftConfig().getDbHome(), "rafts").toString());
 		{
 			// Read Term
 			var termKey = ByteBuffer.Allocate(1);
@@ -416,7 +438,7 @@ public class LogSequence {
 				NodeReady = ByteBuffer.Wrap(nodeReadyValue).ReadBool();
 		}
 
-		Logs = OpenDb(options, Paths.get(Raft.getRaftConfig().getDbHome(), "logs").toString());
+		Logs = OpenDb(DatabaseRocksDb.getCommonOptions(), Paths.get(Raft.getRaftConfig().getDbHome(), "logs").toString());
 		{
 			// Read Last Log Index
 			try (var itLast = Logs.newIterator()) {
@@ -493,8 +515,9 @@ public class LogSequence {
 		var value = log.Encode();
 		Logs.put(WriteOptions, key.Bytes, 0, key.WriteIndex, value.Bytes, 0, value.WriteIndex);
 
-		logger.debug("{}-{} RequestId={} Index={} Count={}", Raft.getName(), Raft.isLeader(),
-				log.getLog().getUnique().getRequestId(), log.getIndex(), GetTestStateMachineCount());
+		if (isDebugEnabled)
+			logger.debug("{}-{} RequestId={} Index={} Count={}", Raft.getName(), Raft.isLeader(),
+					log.getLog().getUnique().getRequestId(), log.getIndex(), GetTestStateMachineCount());
 	}
 
 	private void SaveLogRaw(long index, Binary rawValue) throws RocksDBException {
@@ -503,8 +526,9 @@ public class LogSequence {
 		Logs.put(WriteOptions, key.Bytes, 0, key.WriteIndex,
 				rawValue.InternalGetBytesUnsafe(), rawValue.getOffset(), rawValue.size());
 
-		logger.debug("{}-{} RequestId=? Index={} Count={}",
-				Raft.getName(), Raft.isLeader(), index, GetTestStateMachineCount());
+		if (isDebugEnabled)
+			logger.debug("{}-{} RequestId=? Index={} Count={}",
+					Raft.getName(), Raft.isLeader(), index, GetTestStateMachineCount());
 	}
 
 	private byte[] ReadLogBytes(long index) throws RocksDBException {
@@ -617,12 +641,15 @@ public class LogSequence {
 
 	private long BackgroundApply() throws Throwable {
 		while (!Raft.IsShutdown) {
-			synchronized (Raft) {
+			Raft.lock();
+			try {
 				// ReadLog Again，CommitIndex Maybe Grow.
 				var lastApplicableLog = ReadLog(CommitIndex);
 				TryApply(lastApplicableLog, Raft.getRaftConfig().getBackgroundApplyCount());
 				if (lastApplicableLog != null && LastApplied == lastApplicableLog.getIndex())
 					return 0; // 本次Apply结束。
+			} finally {
+				Raft.unlock();
 			}
 			Thread.yield();
 		}
@@ -639,6 +666,7 @@ public class LogSequence {
 			if (raftLog == null && (raftLog = ReadLog(index)) == null) {
 				logger.warn("What Happened! index={} lastApplicableLog={} LastApplied={}",
 						index, lastApplicableLog.getIndex(), LastApplied);
+				// trySnapshot(); // 错误的时候不做这个尝试了。
 				return; // end?
 			}
 
@@ -648,7 +676,7 @@ public class LogSequence {
 				OpenUniqueRequests(raftLog.getLog().getCreateTime()).Apply(raftLog);
 			LastApplied = raftLog.getIndex(); // 循环可能退出，在这里修改。
 			//*
-			if (LastIndex - LastApplied < 10) {
+			if (isDebugEnabled && LastIndex - LastApplied < 10) {
 				logger.debug("{}-{} {} RequestId={} LastIndex={} LastApplied={} Count={}",
 						Raft.getName(), Raft.isLeader(), Raft.getRaftConfig().getDbHome(),
 						raftLog.getLog().getUnique().getRequestId(), LastIndex, LastApplied,
@@ -659,7 +687,20 @@ public class LogSequence {
 			if (future != null)
 				future.SetResult(0);
 		}
+		// if (isDebugEnabled)
 		// logger.debug($"{Raft.Name}-{Raft.IsLeader} CommitIndex={CommitIndex} RequestId={lastApplicableLog.Log.Unique.RequestId} LastIndex={LastIndex} LastApplied={LastApplied} Count={GetTestStateMachineCount()}");
+		trySnapshot();
+	}
+
+	private void trySnapshot() {
+		var snapshotLogCount = Raft.getRaftConfig().getSnapshotLogCount();
+		if (snapshotLogCount > 0) {
+			if (LastApplied - PrevSnapshotIndex > snapshotLogCount) {
+				PrevSnapshotIndex = LastApplied;
+				Task.run(this::Snapshot, "Snapshot");
+			}
+		}
+		// else disable
 	}
 
 	public long GetTestStateMachineCount() {
@@ -668,7 +709,8 @@ public class LogSequence {
 	}
 
 	public void SendHeartbeatTo(Server.ConnectorEx connector) {
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			connector.setAppendLogActiveTime(System.currentTimeMillis());
 
 			if (!Raft.isLeader())
@@ -691,15 +733,20 @@ public class LogSequence {
 				if (heartbeat.isTimeout())
 					return 0; // skip
 
-				synchronized (Raft) {
+				Raft.lock();
+				try {
 					if (Raft.getLogSequence().TrySetTerm(heartbeat.Result.getTerm()) == SetTermResult.Newer) {
 						// new term found.
 						Raft.ConvertStateTo(Zeze.Raft.Raft.RaftState.Follower);
 						return Procedure.Success;
 					}
+				} finally {
+					Raft.unlock();
 				}
 				return 0;
 			}, Raft.getRaftConfig().getAppendEntriesTimeout());
+		} finally {
+			Raft.unlock();
 		}
 	}
 
@@ -714,7 +761,8 @@ public class LogSequence {
 
 	public void AppendLog(Log log, boolean WaitApply, AppendLogResult result) throws Throwable {
 		TaskCompletionSource<Integer> future = null;
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			if (!Raft.isLeader())
 				throw new RaftRetryException("not leader"); // 快速失败
 
@@ -727,7 +775,7 @@ public class LogSequence {
 			if (WaitApply) {
 				raftLog.setLeaderFuture(future = new TaskCompletionSource<>());
 				if (LeaderAppendLogs.putIfAbsent(raftLog.getIndex(), raftLog) != null) {
-					logger.fatal("LeaderAppendLogs.TryAdd Fail. Index={}", raftLog.getIndex());
+					logger.fatal("LeaderAppendLogs.TryAdd Fail. Index={}", raftLog.getIndex(), new Exception());
 					Raft.FatalKill();
 				}
 			}
@@ -747,6 +795,8 @@ public class LogSequence {
 				result.term = Term;
 				result.index = LastIndex;
 			}
+		} finally {
+			Raft.unlock();
 		}
 
 		if (WaitApply && !future.await(Raft.getRaftConfig().getAppendEntriesTimeout() * 2L + 1000)) {
@@ -771,36 +821,13 @@ public class LogSequence {
 		return Paths.get(Raft.getRaftConfig().getDbHome(), SnapshotFileName).toString();
 	}
 
-	@SuppressWarnings("deprecation")
-	public void StartSnapshotTimer() {
-		synchronized (Raft) {
-			if (SnapshotTimer != null)
-				SnapshotTimer.cancel(false);
-
-			RaftConfig raftConf = Raft.getRaftConfig();
-			if (raftConf.getSnapshotHourOfDay() >= 0 && raftConf.getSnapshotHourOfDay() < 24) {
-				// 每天定点执行。
-				Date now = new Date();
-				Date firstTime = new Date(now.getYear(), now.getMonth(), now.getDate(),
-						raftConf.getSnapshotHourOfDay(),
-						raftConf.getSnapshotMinute(), 0);
-				if (firstTime.getTime() < now.getTime())
-					firstTime.setTime(firstTime.getTime() + 86400_000);
-				var delay = firstTime.getTime() - now.getTime();
-				SnapshotTimer = Task.schedule(delay, () -> Snapshot(false));
-			} else {
-				// 此时 SnapshotMinute 表示Period。
-				SnapshotTimer = Task.schedule((long)raftConf.getSnapshotMinute() * 60 * 1000, () -> Snapshot(false));
-			}
-		}
-	}
-
 	public void EndReceiveInstallSnapshot(String path, InstallSnapshot r) throws Throwable {
 		LogsAvailable = false; // cancel RemoveLogBefore
 		var removeLogBeforeFuture = RemoveLogBeforeFuture;
 		if (removeLogBeforeFuture != null)
 			removeLogBeforeFuture.await();
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			try {
 				// 6. If existing log entry has same index and term as snapshot's
 				// last included entry, retain log entries following it and reply
@@ -822,9 +849,7 @@ public class LogSequence {
 				CancelPendingAppendLogFutures();
 				var logsDir = Paths.get(Raft.getRaftConfig().getDbHome(), "logs").toString();
 				deleteDirectory(new File(logsDir));
-				var options = new Options().setCreateIfMissing(true);
-
-				Logs = OpenDb(options, logsDir);
+				Logs = OpenDb(DatabaseRocksDb.getCommonOptions(), logsDir);
 				var lastIncludedLog = RaftLog.Decode(r.Argument.getLastIncludedLog(),
 						Raft.getStateMachine()::LogFactory);
 				SaveLog(lastIncludedLog);
@@ -844,21 +869,20 @@ public class LogSequence {
 			} finally {
 				LogsAvailable = true;
 			}
+		} finally {
+			Raft.unlock();
 		}
 	}
 
 	public void Snapshot() throws Throwable {
-		Snapshot(false);
-	}
-
-	public void Snapshot(boolean NeedNow) throws Throwable {
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			if (getSnapshotting() || !getInstallSnapshotting().isEmpty())
-				return;
-			if (LastApplied - FirstIndex < Raft.getRaftConfig().getSnapshotMinLogCount() && !NeedNow)
 				return;
 
 			setSnapshotting(true);
+		} finally {
+			Raft.unlock();
 		}
 		try {
 			// 忽略Snapshot返回结果。肯定是重复调用导致的。
@@ -868,12 +892,12 @@ public class LogSequence {
 			logger.info("{} Snapshot Path={} LastIndex={} LastTerm={}",
 					Raft.getName(), path, result.LastIncludedIndex, result.LastIncludedTerm);
 		} finally {
-			synchronized (Raft) {
+			Raft.lock();
+			try {
 				setSnapshotting(false);
+			} finally {
+				Raft.unlock();
 			}
-
-			// restart
-			StartSnapshotTimer();
 		}
 	}
 
@@ -927,7 +951,7 @@ public class LogSequence {
 			// 这一般的情况是snapshot文件被删除了。
 			// 【注意】这种情况也许报错更好？
 			// 内部会判断，不会启动多个snapshot。
-			Snapshot(true);
+			Snapshot();
 		}
 	}
 
@@ -935,7 +959,8 @@ public class LogSequence {
 	private long ProcessAppendEntriesResult(Server.ConnectorEx connector, Protocol<?> p) throws Throwable {
 		// 这个rpc处理流程总是返回 Success，需要统计观察不同的分支的发生情况，再来定义不同的返回值。
 		var r = (AppendEntries)p;
-		synchronized (Raft) {
+		Raft.lock();
+		try {
 			if (r.isTimeout() && Raft.isLeader()) {
 				TrySendAppendEntries(connector, r); // timeout and resend
 				return Procedure.Success;
@@ -973,12 +998,15 @@ public class LogSequence {
 				// leader snapshot，follower 完全没法匹配了，后续的 TrySendAppendEntries 将启动 InstallSnapshot。
 				connector.setNextIndex(FirstIndex);
 			} else if (r.Result.getNextIndex() >= LastIndex) {
-				logger.fatal("Impossible r.Result.NextIndex >= LastIndex there must be a bug.");
+				logger.fatal("Impossible r.Result.NextIndex({}) >= LastIndex({}) there must be a bug.",
+						r.Result.getNextIndex(), LastIndex, new Exception());
 				Raft.FatalKill();
 			} else
 				connector.setNextIndex(r.Result.getNextIndex()); // fast locate
 			TrySendAppendEntries(connector, r); //resend. use new NextIndex。
 			return Procedure.Success;
+		} finally {
+			Raft.unlock();
 		}
 	}
 
@@ -1105,7 +1133,7 @@ public class LogSequence {
 				break;
 			case Leader:
 				logger.fatal("Receive AppendEntries from another leader={} with same term={}, there must be a bug. this={}",
-						r.Argument.getLeaderId(), Term, Raft.getLeaderId());
+						r.Argument.getLeaderId(), Term, Raft.getLeaderId(), new Exception());
 				Raft.FatalKill();
 				return 0;
 			}
@@ -1131,8 +1159,9 @@ public class LogSequence {
 			r.Result.setNextIndex(r.Argument.getPrevLogIndex() > LastIndex ? LastIndex + 1 : 0);
 
 			r.SendResult();
-			logger.debug("this={} Leader={} Index={} prevLog mismatch",
-					Raft.getName(), r.Argument.getLeaderId(), r.Argument.getPrevLogIndex());
+			if (isDebugEnabled)
+				logger.debug("this={} Leader={} Index={} prevLog mismatch",
+						Raft.getName(), r.Argument.getLeaderId(), r.Argument.getPrevLogIndex());
 			return Procedure.Success;
 		}
 
@@ -1152,8 +1181,8 @@ public class LogSequence {
 		for (; entryIndex < r.Argument.getEntries().size(); ++entryIndex, ++copyLogIndex) {
 			var copyLog = RaftLog.Decode(r.Argument.getEntries().get(entryIndex), Raft.getStateMachine()::LogFactory);
 			if (copyLog.getIndex() != copyLogIndex) {
-				logger.fatal("copyLog.Index != copyLogIndex Leader={} this={}",
-						r.Argument.getLeaderId(), Raft.getName());
+				logger.fatal("copyLog.Index({}) != copyLogIndex({}) Leader={} this={}",
+						copyLog.getIndex(), copyLogIndex, r.Argument.getLeaderId(), Raft.getName(), new Exception());
 				Raft.FatalKill();
 			}
 			if (copyLog.getIndex() < FirstIndex)
@@ -1170,7 +1199,8 @@ public class LogSequence {
 				// delete the existing entry and all that follow it(§5.3)
 				// raft.pdf 5.3
 				if (conflictCheck.getIndex() <= CommitIndex) {
-					logger.fatal("{} truncate committed entries", Raft.getName());
+					logger.fatal("{} truncate committed entries: {} <= {}", Raft.getName(),
+							conflictCheck.getIndex(), CommitIndex, new Exception());
 					Raft.FatalKill();
 				}
 				RemoveLogAndCancelStart(conflictCheck.getIndex(), LastIndex);
@@ -1197,7 +1227,8 @@ public class LogSequence {
 			TryStartApplyTask(ReadLog(CommitIndex));
 		}
 		r.Result.setSuccess(true);
-		logger.debug("{}: {}", Raft.getName(), r);
+		if (isDebugEnabled)
+			logger.debug("{}: {}", Raft.getName(), r);
 		r.SendResultCode(0);
 
 		return Procedure.Success;
@@ -1216,9 +1247,9 @@ public class LogSequence {
 			return;
 
 		logger.info("================= logs ======================");
-		logger.info(logs);
+		logger.info("{}", logs);
 		logger.info("================= copies ======================");
-		logger.info(copies);
+		logger.info("{}", copies);
 		Raft.FatalKill();
 	}
 }

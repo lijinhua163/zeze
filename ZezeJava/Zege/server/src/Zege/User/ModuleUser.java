@@ -25,12 +25,13 @@ public class ModuleUser extends AbstractModule {
         if (user.getCreateTime() == 0) {
             user.setCreateTime(System.currentTimeMillis());
         }
-        Transaction.getCurrent().RunWhileCommit(r::SendResult);
+        Transaction.getCurrent().runWhileCommit(r::SendResult);
 
         // 【准备测试数据】
         // 把用户加入默认群，并且把群加入用户好友列表。
         var defaultGroup = "wanmei@group";
-        var group = App.Zege_Friend.getDepartmentTree(defaultGroup);
+        var group = App.Zege_Friend.getGroup(defaultGroup);
+        group.create();
         var member = new BMember();
         member.setAccount(account);
         group.getGroupMembers().put(account, member);

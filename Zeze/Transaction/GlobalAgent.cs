@@ -13,7 +13,7 @@ namespace Zeze.Transaction
     internal interface IGlobalAgent : IDisposable
     {
         // (ResultCode, State, GlobalSerialId)
-        public Task<(long, int, long)> Acquire(Binary gkey, int state);
+        public Task<(long, int)> Acquire(Binary gkey, int state, bool fresh);
         public int GetGlobalCacheManagerHashIndex(Binary gkey);
     }
 
@@ -27,24 +27,41 @@ namespace Zeze.Transaction
             Stop();
         }
 
-        public class Agent
+        public class Agent : GlobalAgentBase
         {
             public bool ActiveClose { get; private set; } = false;
             public Connector Connector { get; private set; }
             public Zeze.Util.AtomicLong LoginTimes { get; } = new();
-            public int GlobalCacheManagerHashIndex { get; }
 
-            private readonly Zeze.Util.AtomicLong LastErrorTime = new();
+            private long LastErrorTime;
             public const long FastErrorPeriod = 2 * 1000;
 
-            public Agent(GlobalClient client, string host, int port, int globalCacheManagerHashIndex)
+            public Agent(Application zeze, GlobalClient client, string host, int port, int globalCacheManagerHashIndex)
+                : base(zeze)
             {
-                GlobalCacheManagerHashIndex = globalCacheManagerHashIndex;
+                base.GlobalCacheManagerHashIndex = globalCacheManagerHashIndex;
                 this.Connector = new Connector(host, port, true)
                 {
                     UserState = this
                 };
+                Connector.MaxReconnectDelay = AchillesHeelConfig.ReconnectTimer;
                 client.Config.AddConnector(this.Connector);
+            }
+
+            protected override void CancelPending()
+            {
+                // 非Raft版本没有Pending，不需要执行操作。以后如果实现了Pending，需要实现Cancel。
+            }
+
+            public override void KeepAlive()
+            {
+                var rpc = new KeepAlive();
+                rpc.Send(Connector.TryGetReadySocket(), p =>
+                {
+                    if (false == rpc.IsTimeout && rpc.ResultCode == 0)
+                        SetActiveTime(Util.Time.NowUnixMillis);
+                    return Task.FromResult(0L);
+                }, Config.KeepAliveTimeout);
             }
 
             private static void ThrowException(string msg, Exception cause = null)
@@ -55,14 +72,32 @@ namespace Zeze.Transaction
                 throw new Exception(msg, cause);
             }
 
+            public void SetFastFail()
+            {
+                // 并发的等待，简单用个规则：在间隔期内不再设置。
+                long now = global::Zeze.Util.Time.NowUnixMillis;
+                lock (this)
+                {
+                    if (now - LastErrorTime > Config.ServerFastErrorPeriod)
+                        LastErrorTime = now;
+                }
+            }
+
+            public void VerifyFastFail()
+            {
+                long now = global::Zeze.Util.Time.NowUnixMillis;
+                lock (this)
+                {
+                    if (now - LastErrorTime < Config.ServerFastErrorPeriod)
+                        ThrowException("GlobalAgent.FastFail");
+                }
+            }
+
             public async Task<AsyncSocket> ConnectAsync()
             {
                 var so = Connector.TryGetReadySocket();
                 if (null != so)
                     return so;
-
-                if (global::Zeze.Util.Time.NowUnixMillis - LastErrorTime.Get() < FastErrorPeriod)
-                    ThrowException("GlobalAgent.Connect: In Forbid Login Period");
 
                 try
                 {
@@ -70,13 +105,7 @@ namespace Zeze.Transaction
                 }
                 catch (Exception e)
                 {
-                    // 并发的等待，简单用个规则：在间隔期内不再设置。
-                    long now = global::Zeze.Util.Time.NowUnixMillis;
-                    lock (this)
-                    {
-                        if (now - LastErrorTime.Get() > FastErrorPeriod)
-                            LastErrorTime.GetAndSet(now);
-                    }
+                    SetFastFail();
                     ThrowException("GlobalAgent.Connect: Login Timeout", e);
                 }
                 return null; // never got here
@@ -141,23 +170,47 @@ namespace Zeze.Transaction
             return gkey.GetHashCode() % Agents.Length;
         }
 
-        public async Task<(long, int, long)> Acquire(Binary gkey, int state)
+        public async Task<(long, int)> Acquire(Binary gkey, int state, bool fresh)
         {
             if (null != Client)
             {
                 var agent = Agents[GetGlobalCacheManagerHashIndex(gkey)]; // hash
+                if (agent.IsReleasing())
+                {
+                    agent.SetFastFail(); // 一般是超时失败，此时必须进入快速失败模式。
+                    if (null == Transaction.Current)
+                        throw new Exception("GlobalAgent.Acquire Exception");
+                    Transaction.Current.ThrowAbort("GlobalAgent.Acquire Exception");
+                }
+
+                agent.VerifyFastFail();
                 var socket = await agent.ConnectAsync();
 
                 // 请求处理错误抛出异常（比如网络或者GlobalCacheManager已经不存在了），打断外面的事务。
                 // 一个请求异常不关闭连接，尝试继续工作。
                 var rpc = new Acquire(gkey, state);
-                await rpc.SendAsync(socket, 12000);
+                if (fresh)
+                    rpc.ResultCode = GlobalCacheManagerServer.AcquireFreshSource;
+                try
+                {
+                    await rpc.SendAsync(socket, agent.Config.AcquireTimeout);
+                }
+                catch (Exception e)
+                {
+                    agent.SetFastFail(); // 一般是超时失败，此时必须进入快速失败模式。
+                    if (null == Transaction.Current)
+                        throw new Exception("GlobalAgent.Acquire Exception", e);
+                    Transaction.Current.ThrowAbort("GlobalAgent.Acquire Exception", e);
+                }
                 /*
                 if (rpc.ResultCode != 0) // 这个用来跟踪调试，正常流程使用Result.State检查结果。
                 {
                     logger.Warn("Acquire ResultCode={0} {1}", rpc.ResultCode, rpc.Result);
                 }
                 */
+                if (false == rpc.IsTimeout)
+                    agent.SetActiveTime(Util.Time.NowUnixMillis);
+
                 if (rpc.ResultCode < 0)
                 {
                     Transaction.Current.ThrowAbort("GlobalAgent.Acquire Failed");
@@ -171,10 +224,10 @@ namespace Zeze.Transaction
                         // never got here
                         break;
                 }
-                return (rpc.ResultCode, rpc.Result.State, rpc.Result.GlobalSerialId);
+                return (rpc.ResultCode, rpc.Result.State);
             }
             logger.Debug("Acquire local ++++++");
-            return (0, state, 0);
+            return (0, state);
         }
 
         public async Task<long> ProcessReduceRequest(Zeze.Net.Protocol p)
@@ -268,15 +321,20 @@ namespace Zeze.Transaction
                     Factory = () => new NormalClose(),
                     TransactionLevel = TransactionLevel.None
                 });
+                Client.AddFactoryHandle(new KeepAlive().TypeId, new Service.ProtocolFactoryHandle()
+                {
+                    Factory = () => new KeepAlive(),
+                    TransactionLevel = TransactionLevel.None
+                });
 
                 Agents = new Agent[hostNameOrAddress.Length];
                 for (int i = 0; i < hostNameOrAddress.Length; ++i)
                 {
                     var hp = hostNameOrAddress[i].Split(':');
                     if (hp.Length > 1)
-                        Agents[i] = new Agent(Client, hp[0], int.Parse(hp[1]), i);
+                        Agents[i] = new Agent(Zeze, Client, hp[0], int.Parse(hp[1]), i);
                     else
-                        Agents[i] = new Agent(Client, hp[0], port, i);
+                        Agents[i] = new Agent(Zeze, Client, hp[0], port, i);
                 }
                 Client.Start();
             }
@@ -325,10 +383,22 @@ namespace Zeze.Transaction
                     }
                     else if (relogin.ResultCode != 0)
                     {
+                        // 清理本地已经分配的记录锁。
+                        // 1. 关闭网络。下面两行有点重复，就这样了。
                         so.Close(new Exception("GlobalAgent.ReLogin Fail code=" + relogin.ResultCode));
+                        so.Connector.Stop();
+                        // 2. 开始清理，由守护线程保护，必须成功。
+                        agent.StartRelease(Zeze, () =>
+                        {
+                            // 3. 重置登录次数，下一次连接成功，会发送Login。
+                            agent.LoginTimes.GetAndSet(0);
+                            // 4. 开始网络连接。
+                            so.Connector.Start();
+                        });
                     }
                     else
                     {
+                        agent.SetActiveTime(Util.Time.NowUnixMillis);
                         agent.LoginTimes.IncrementAndGet();
                         base.OnHandshakeDone(so);
                     }
@@ -352,7 +422,9 @@ namespace Zeze.Transaction
                     }
                     else
                     {
+                        agent.SetActiveTime(Util.Time.NowUnixMillis);
                         agent.LoginTimes.IncrementAndGet();
+                        agent.Initialize(login.Result.MaxNetPing, login.Result.ServerProcessTime, login.Result.ServerReleaseTimeout);
                         base.OnHandshakeDone(so);
                     }
                     return Task.FromResult(0L);

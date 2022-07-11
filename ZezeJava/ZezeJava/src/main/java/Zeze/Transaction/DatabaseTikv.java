@@ -1,5 +1,10 @@
 package Zeze.Transaction;
 
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import Zeze.Config;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Util.KV;
@@ -9,13 +14,6 @@ import org.tikv.common.key.Key;
 import org.tikv.kvproto.Kvrpcpb;
 import org.tikv.raw.RawKVClient;
 import org.tikv.shade.com.google.protobuf.ByteString;
-import org.tikv.shade.com.google.protobuf.Internal;
-
-import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 public class DatabaseTikv extends Database {
 	public static final int PAGE_SIZE = 512;
@@ -31,22 +29,19 @@ public class DatabaseTikv extends Database {
 		setDirectOperates(new OperatesTikv(this));
 	}
 
-	public final static class OperatesTikv implements Operates {
-		private final DatabaseTikv DatabaseReal;
+	public static final class OperatesTikv implements Operates {
 		private static final String name = "zeze.OperatesTikv.Schemas";
+
+		private final DatabaseTikv DatabaseReal;
 		private final Table table;
-
-		public DatabaseTikv getDatabaseReal() {
-			return DatabaseReal;
-		}
-
-		public Database getDatabase() {
-			return getDatabaseReal();
-		}
 
 		public OperatesTikv(DatabaseTikv database) {
 			DatabaseReal = database;
 			table = database.OpenTable(name);
+		}
+
+		public DatabaseTikv getDatabase() {
+			return DatabaseReal;
 		}
 
 		@Override
@@ -66,7 +61,11 @@ public class DatabaseTikv extends Database {
 			version++;
 			dv.Version = version;
 			dv.Data = data;
-			table.Replace(getDatabase().BeginTransaction(), key, ByteBuffer.Wrap(dv.Encode()));
+			try (var txn = getDatabase().BeginTransaction()) {
+				table.Replace(txn, key, ByteBuffer.Wrap(dv.Encode()));
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
 			return Zeze.Util.KV.Create(version, true);
 		}
 
@@ -102,7 +101,7 @@ public class DatabaseTikv extends Database {
 			public final byte[] Encode() {
 				int dataSize = Data.Size();
 				var bb = ByteBuffer.Allocate(ByteBuffer.writeUIntSize(dataSize) + dataSize + ByteBuffer.writeLongSize(Version));
-				this.Encode(bb);
+				Encode(bb);
 				return bb.Bytes;
 			}
 		}
@@ -117,12 +116,12 @@ public class DatabaseTikv extends Database {
 		try {
 			client.close();
 		} catch (Exception e) {
-			e.printStackTrace();
+			logger.error("", e);
 		}
 		try {
 			session.close();
 		} catch (Exception e) {
-			e.printStackTrace();
+			logger.error("", e);
 		}
 		super.Close();
 	}
@@ -149,11 +148,11 @@ public class DatabaseTikv extends Database {
 		@Override
 		public final void Commit() {
 			if (!datas.isEmpty()) {
-				database.client.batchPutAtomic(datas);
+				database.client.batchPut(datas);
 				datas.clear();
 			}
 			if (!deleteKeys.isEmpty()) {
-				database.client.batchDeleteAtomic(deleteKeys);
+				database.client.batchDelete(deleteKeys);
 				deleteKeys.clear();
 			}
 		}
@@ -179,20 +178,15 @@ public class DatabaseTikv extends Database {
 		return new TikvTable(this, name);
 	}
 
-	public final static class TikvTable implements Table {
+	public static final class TikvTable implements Table {
 		private final DatabaseTikv database;
-
-		public DatabaseTikv getDatabaseReal() {
-			return database;
-		}
-
-		@Override
-		public Database getDatabase() {
-			return database;
-		}
-
 		private final String name;
 		private final ByteBuffer keyPrefix;
+
+		@Override
+		public DatabaseTikv getDatabase() {
+			return database;
+		}
 
 		public String getName() {
 			return name;
@@ -211,7 +205,7 @@ public class DatabaseTikv extends Database {
 			var nameUtf8 = name.getBytes(StandardCharsets.UTF_8);
 			keyPrefix = ByteBuffer.Allocate(nameUtf8.length + 1);
 			keyPrefix.Append(nameUtf8);
-			keyPrefix.WriteByte((byte) 0);
+			keyPrefix.WriteByte((byte)0);
 		}
 
 		@Override
@@ -220,27 +214,19 @@ public class DatabaseTikv extends Database {
 
 		@Override
 		public ByteBuffer Find(ByteBuffer key) {
-			byte[] value;
-			try {
-				value = database.client.get(withKeySpace(keyPrefix, key)).toByteArray();
-			} catch (Exception e) {
-				throw new RuntimeException(e);
-			}
-			if (null == value || value == Internal.EMPTY_BYTE_ARRAY) {
-				return null;
-			}
-			return ByteBuffer.Wrap(value);
+			var result = database.client.get(withKeySpace(keyPrefix, key));
+			return result.isPresent() ? ByteBuffer.Wrap(result.get().toByteArray()) : null;
 		}
 
 		@Override
 		public void Remove(Transaction t, ByteBuffer key) {
-			TikvTrans trans = ((TikvTrans) t);
+			TikvTrans trans = ((TikvTrans)t);
 			trans.delete(withKeySpace(keyPrefix, key));
 		}
 
 		@Override
 		public void Replace(Transaction t, ByteBuffer key, ByteBuffer value) {
-			TikvTrans trans = ((TikvTrans) t);
+			TikvTrans trans = ((TikvTrans)t);
 			trans.put(withKeySpace(keyPrefix, key), ByteString.copyFrom(value.Bytes, value.ReadIndex, value.Size()));
 		}
 
@@ -258,6 +244,33 @@ public class DatabaseTikv extends Database {
 					ByteString key = pair.getKey();
 					ByteString value = pair.getValue();
 					if (!callback.handle(key.substring(length).toByteArray(), value.toByteArray())) {
+						return countWalked;
+					}
+					Key currentKey = Key.toRawKey(key);
+					if (currentKey.compareTo(maxKey) > 0) {
+						maxKey = currentKey;
+					}
+				}
+				if (kvPairs.size() < PAGE_SIZE) {
+					return countWalked;
+				}
+				startKey = maxKey.next().toByteString();
+			}
+		}
+
+		@Override
+		public long WalkKey(TableWalkKeyRaw callback) {
+			long countWalked = 0;
+			ByteString startKey = ByteString.copyFrom(keyPrefix.Bytes, keyPrefix.ReadIndex, keyPrefix.Size());
+			int length = name.getBytes(StandardCharsets.UTF_8).length + 1;
+			final ByteString endKey = Key.toRawKey(startKey).nextPrefix().toByteString();
+			Key maxKey = Key.MIN;
+			while (true) {
+				List<Kvrpcpb.KvPair> kvPairs = database.client.scan(startKey, endKey, PAGE_SIZE);
+				countWalked += kvPairs.size();
+				for (Kvrpcpb.KvPair pair : kvPairs) {
+					ByteString key = pair.getKey();
+					if (!callback.handle(key.substring(length).toByteArray())) {
 						return countWalked;
 					}
 					Key currentKey = Key.toRawKey(key);

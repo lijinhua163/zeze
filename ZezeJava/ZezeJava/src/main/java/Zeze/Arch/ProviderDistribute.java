@@ -1,10 +1,14 @@
 package Zeze.Arch;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import Zeze.Net.Service;
+import Zeze.Serialize.ByteBuffer;
 import Zeze.Services.ServiceManager.Agent;
 import Zeze.Services.ServiceManager.ServiceInfo;
+import Zeze.Util.ConsistentHash;
 import Zeze.Util.OutLong;
 import Zeze.Util.Random;
 
@@ -19,16 +23,60 @@ public class ProviderDistribute {
 	public Service ProviderService;
 	private final AtomicInteger FeedFullOneByOneIndex = new AtomicInteger();
 
+	public final ConcurrentHashMap<String, ConsistentHash<ServiceInfo>> ConsistentHashes = new ConcurrentHashMap<>();
+
+	public void AddServer(Agent.SubscribeState state, ServiceInfo s) {
+		var consistentHash = ConsistentHashes.computeIfAbsent(s.getServiceName(), key -> new ConsistentHash<>());
+		consistentHash.add(s.getServiceIdentity(), s);
+	}
+
+	public void RemoveServer(Agent.SubscribeState state, ServiceInfo s) {
+		var consistentHash = ConsistentHashes.get(s.getServiceName());
+		if (null != consistentHash)
+			consistentHash.remove(s.getServiceIdentity(), s);
+	}
+
+	public void ApplyServers(Agent.SubscribeState ass) {
+		var consistentHash = ConsistentHashes.computeIfAbsent(ass.getServiceName(), key -> new ConsistentHash<>());
+		var nodes = consistentHash.getNodes();
+		var current = new HashSet<ServiceInfo>();
+		for (var node : ass.getServiceInfos().getServiceInfoListSortedByIdentity()) {
+			consistentHash.add(node.getServiceIdentity(), node);
+			current.add(node);
+		}
+		for (var node : nodes) {
+			if (!current.contains(node))
+				consistentHash.remove(node.getServiceIdentity(), node);
+		}
+	}
+
 	public static String MakeServiceName(String serviceNamePrefix, int moduleId) {
 		return serviceNamePrefix + moduleId;
 	}
 
-	public ServiceInfo ChoiceHash(Agent.SubscribeState providers, int hash) {
-		var list = providers.getServiceInfos().getServiceInfoListSortedByIdentity();
-		if (list.isEmpty()) {
+	public ConsistentHash<ServiceInfo> getConsistentHash(String name) {
+		return ConsistentHashes.get(name);
+	}
+
+	// ChoiceDataIndex 用于RedirectAll或者那些已知数据分块索引的地方。
+	public ServiceInfo ChoiceDataIndex(ConsistentHash<ServiceInfo> consistentHash, int dataIndex, int dataConcurrentLevel) {
+		if (consistentHash == null)
 			return null;
-		}
-		return list.get(Integer.remainderUnsigned(hash, list.size()));
+		if (consistentHash.getNodes().size() > dataConcurrentLevel)
+			throw new IllegalStateException("too many server: " + consistentHash.getNodes().size() + " > " + dataConcurrentLevel);
+		return consistentHash.get(ByteBuffer.calc_hashnr(dataIndex));
+	}
+
+	public ServiceInfo ChoiceHash(Agent.SubscribeState providers, int hash, int dataConcurrentLevel) {
+		var consistentHash = ConsistentHashes.get(providers.getServiceName());
+		if (dataConcurrentLevel <= 1)
+			return consistentHash != null ? consistentHash.get(hash) : null;
+
+		return ChoiceDataIndex(consistentHash, (int)((hash & 0xffff_ffffL) % dataConcurrentLevel), dataConcurrentLevel);
+	}
+
+	public ServiceInfo ChoiceHash(Agent.SubscribeState providers, int hash) {
+		return ChoiceHash(providers, hash, 1);
 	}
 
 	public boolean ChoiceHash(Agent.SubscribeState providers, int hash, OutLong provider) {
@@ -37,7 +85,7 @@ public class ProviderDistribute {
 		if (serviceInfo == null)
 			return false;
 
-		var providerModuleState = (ProviderModuleState)serviceInfo.getLocalState();
+		var providerModuleState = (ProviderModuleState)providers.LocalStates.get(serviceInfo.getServiceIdentity());
 		if (providerModuleState == null)
 			return false;
 
@@ -56,7 +104,7 @@ public class ProviderDistribute {
 		// 新的provider在后面，从后面开始搜索。后面的可能是新的provider。
 		for (int i = list.size() - 1; i >= 0; --i) {
 			var serviceInfo = list.get(i);
-			var providerModuleState = (ProviderModuleState)serviceInfo.getLocalState();
+			var providerModuleState = (ProviderModuleState)providers.LocalStates.get(serviceInfo.getServiceIdentity());
 			if (providerModuleState == null) {
 				continue;
 			}
@@ -107,7 +155,7 @@ public class ProviderDistribute {
 			for (int i = 0; i < list.size(); ++i, FeedFullOneByOneIndex.incrementAndGet()) {
 				var index = Integer.remainderUnsigned(FeedFullOneByOneIndex.get(), list.size()); // current
 				var serviceInfo = list.get(index);
-				var providerModuleState = (ProviderModuleState)serviceInfo.getLocalState();
+				var providerModuleState = (ProviderModuleState)providers.LocalStates.get(serviceInfo.getServiceIdentity());
 				if (providerModuleState == null)
 					continue;
 				var providerSocket = ProviderService.GetSocket(providerModuleState.SessionId);
@@ -131,41 +179,17 @@ public class ProviderDistribute {
 		}
 	}
 
-	public boolean ChoiceProvider(String serviceNamePrefix, int moduleId, int hash, OutLong provider) {
-		var serviceName = MakeServiceName(serviceNamePrefix, moduleId);
-
-		var volatileProviders = Zeze.getServiceManagerAgent().getSubscribeStates().get(serviceName);
-		if (volatileProviders == null)
-			return false;
-
-		var serviceInfo = ChoiceHash(volatileProviders, hash);
-		if (serviceInfo == null)
-			return false;
-
-		var providerModuleState = (ProviderModuleState)serviceInfo.getLocalState();
-		if (providerModuleState == null) {
-			if (String.valueOf(Zeze.getConfig().getServerId()).equals(serviceInfo.getServiceIdentity())) {
-				provider.Value = 0;
-				return true;
-			}
-			return false;
-		}
-
-		provider.Value = providerModuleState.SessionId;
-		return true;
-	}
-
 	public boolean ChoiceProviderByServerId(String serviceNamePrefix, int moduleId, int serverId, OutLong provider) {
 		var serviceName = MakeServiceName(serviceNamePrefix, moduleId);
 
-		var volatileProviders = Zeze.getServiceManagerAgent().getSubscribeStates().get(serviceName);
-		if (volatileProviders == null) {
+		var providers = Zeze.getServiceManagerAgent().getSubscribeStates().get(serviceName);
+		if (providers == null) {
 			provider.Value = 0L;
 			return false;
 		}
-		var si = volatileProviders.getServiceInfos().findServiceInfoByServerId(serverId);
+		var si = providers.getServiceInfos().findServiceInfoByServerId(serverId);
 		if (si != null) {
-			var state = (ProviderModuleState)si.getLocalState();
+			var state = (ProviderModuleState)providers.LocalStates.get(si.getServiceIdentity());
 			provider.Value = state.SessionId;
 			return true;
 		}

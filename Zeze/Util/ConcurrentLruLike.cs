@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Zeze.Util
 {
@@ -22,6 +23,16 @@ namespace Zeze.Util
             {
                 Value = value;
                 LruNode = lruNode;
+            }
+
+            public ConcurrentDictionary<K, LruItem> GetAndSetLruNodeNull()
+            {
+                return Interlocked.Exchange(ref _LruNode, null);
+            }
+
+            public bool CompareAndSetLruNodeNull(ConcurrentDictionary<K, LruItem> c)
+            {
+                return Interlocked.CompareExchange(ref _LruNode, null, c) == c;
             }
         }
 
@@ -72,37 +83,29 @@ namespace Zeze.Util
             Util.Scheduler.Schedule(CleanNow, CleanPeriod);
         }
 
-        public V GetOrAdd(K k, Func<K, V> factory)
+        public V GetOrAdd(K key, Func<K, V> factory)
         {
-            bool isNew = false;
-            var lruItem = DataMap.GetOrAdd(k, (k) =>
+            var lruHot = LruHot;
+            var lruItem = DataMap.GetOrAdd(key, k =>
             {
-                V value = factory(k);
-                isNew = true;
-                var volatiletmp = LruHot;
-                var lruItem = new LruItem(value, volatiletmp);
-                volatiletmp[k] = lruItem; // MUST replace
+                var lruItem = new LruItem(factory(k), lruHot);
+                lruHot[k] = lruItem; // MUST replace
                 return lruItem;
             });
 
-            if (false == isNew)
-            {
-                AdjustLru(k, lruItem);
-            }
+            if (lruItem.LruNode != lruHot)
+                AdjustLru(key, lruItem, lruHot);
             return lruItem.Value;
         }
 
-        private void AdjustLru(K key, LruItem lruItem)
+        private void AdjustLru(K key, LruItem lruItem, ConcurrentDictionary<K, LruItem> curLruHot)
         {
-            var volatiletmp = LruHot;
-            if (lruItem.LruNode != volatiletmp)
+            var oldNode = lruItem.GetAndSetLruNodeNull();
+            if (oldNode != null)
             {
-                // compare key and value
-                lruItem.LruNode.TryRemove(KeyValuePair.Create(key, lruItem));
-                if (volatiletmp.TryAdd(key, lruItem)) // maybe fail
-                {
-                    lruItem.LruNode = volatiletmp;
-                }
+                oldNode.TryRemove(key, out _);
+                if (curLruHot.TryAdd(key, lruItem))
+                    lruItem.LruNode = curLruHot;
             }
         }
 
@@ -118,13 +121,30 @@ namespace Zeze.Util
             if (DataMap.TryGetValue(key, out var lruItem))
             {
                 if (adjustLru)
-                    AdjustLru(key, lruItem);
+                {
+                    var lruHot = LruHot;
+                    if (lruItem.LruNode != lruHot)
+                        AdjustLru(key, lruItem, lruHot);
+                }
                 value = lruItem.Value;
                 return true;
             }
             value = default;
             return false;
         }
+
+        public long WalkKey(Func<K, bool> callback)
+        {
+            long cw = 0;
+            foreach (var e in DataMap)
+            {
+                if (false == callback(e.Key))
+                    return cw;
+                ++cw;
+            }
+            return cw;
+        }
+
 
         private int GetLruInitialCapacity()
         {
@@ -149,7 +169,7 @@ namespace Zeze.Util
                 // 当对Key再次GetOrAdd时，LruNode里面可能已经存在旧的record。
                 // 1. GetOrAdd 需要 replace 更新
                 // 2. 必须使用 Pair，有可能 LurNode 里面已经有新建的记录了。
-                e.LruNode.TryRemove(KeyValuePair.Create(key, e));
+                e.LruNode?.TryRemove(KeyValuePair.Create(key, e));
                 value = e.Value;
                 return true;
             }
@@ -157,7 +177,37 @@ namespace Zeze.Util
             return false;
         }
 
-        public void CleanNow(SchedulerTask taskNotUsed)
+        private void TryPollLruQueue()
+        {
+            var cap = LruQueue.Count - 8640;
+            if (cap <= 0)
+                return;
+
+            var polls = new List<ConcurrentDictionary<K, LruItem>>(cap);
+            while (LruQueue.Count > 8640)
+            {
+                // 大概，删除超过一天的节点。
+                if (false == LruQueue.TryDequeue(out var node))
+                    break;
+                polls.Add(node);
+            }
+
+            // 把被删除掉的node里面的记录迁移到当前最老(head)的node里面。
+            if (false == LruQueue.TryPeek(out var head))
+                throw new Exception("Impossible!");
+            foreach (var poll in polls)
+            {
+                foreach (var e in poll)
+                {
+                    // concurrent see GetOrAdd
+                    var r = e.Value;
+                    if (r.CompareAndSetLruNodeNull(poll) && head.TryAdd(e.Key, r)) // 并发访问导致这个记录已经被迁移走。
+                        r.LruNode = head;                    
+                }
+            }
+        }
+
+        private void CleanNow(SchedulerTask taskNotUsed)
         {
             // 这个任务的执行时间可能很长，
             // 不直接使用 Scheduler 的定时任务，
@@ -166,6 +216,7 @@ namespace Zeze.Util
             if (Capacity <= 0)
             {
                 Scheduler.Schedule(CleanNow, CleanPeriod);
+                TryPollLruQueue();
                 return; // 容量不限
             }
 
@@ -198,12 +249,12 @@ namespace Zeze.Util
                     else
                     {
                         logger.Warn($"remain record when clean oldest lrunode.");
+                        int sleepms = CleanPeriodWhenExceedCapacity > 1000
+                            ? CleanPeriodWhenExceedCapacity : 1000;
+                        System.Threading.Thread.Sleep(sleepms);
                     }
-
-                    int sleepms = CleanPeriodWhenExceedCapacity > 1000
-                        ? CleanPeriodWhenExceedCapacity : 1000;
-                    System.Threading.Thread.Sleep(sleepms);
                 }
+                TryPollLruQueue();
             }
             finally
             {

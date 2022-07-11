@@ -1,15 +1,21 @@
 package Zeze.Raft;
 
+import java.util.function.ToLongFunction;
 import Zeze.Net.AsyncSocket;
+import Zeze.Net.Protocol;
 import Zeze.Net.Rpc;
 import Zeze.Serialize.ByteBuffer;
 import Zeze.Transaction.Bean;
+import Zeze.Util.TaskCompletionSource;
 
 public abstract class RaftRpc<TArgument extends Bean, TResult extends Bean> extends Rpc<TArgument, TResult> implements IRaftRpc {
 	private long CreateTime;
 	private UniqueRequestId Unique = new UniqueRequestId();
 	private long SendTime;
 	private boolean Urgent;
+
+	TaskCompletionSource<RaftRpc<TArgument, TResult>> Future;
+	ToLongFunction<Protocol<?>> Handle;
 
 	@Override
 	public long getCreateTime() {
@@ -55,6 +61,7 @@ public abstract class RaftRpc<TArgument extends Bean, TResult extends Bean> exte
 		bridge.Argument = Argument;
 		bridge.setCreateTime(CreateTime);
 		bridge.setUnique(Unique);
+		bridge.setResultCode(this.getResultCode());
 		return bridge.Send(socket, getResponseHandle(), getTimeout());
 	}
 
